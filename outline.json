@@ -1,0 +1,194 @@
+{
+  "alignment": {
+    "topic_focus": "实习内容汇报：OmniStream表达式开发与PPT-Agentskill开发",
+    "objective": "实习答辩",
+    "scenario": "答辩会议·中密度",
+    "page_count": 22,
+    "audience": "评委与导师（技术与管理混合）",
+    "source_fidelity": "以本地资料为主，补充网上调研",
+    "content_scope": {
+      "must_cover": ["OmniStream表达式开发", "PPT-Agentskill架构", "PPTv2agent参考", "skill框架比较", "公式原生插入方案", "Wiki产出"],
+      "skip": ["个人独立项目knomate"],
+      "forbidden": ["未验证数据", "虚构内容"]
+    },
+    "style_tendency": "academic"
+  },
+  "slides": [
+    {
+      "index": 1,
+      "title": "封面",
+      "context": "实习生答辩封面，姓名/部门/导师/直接主管信息",
+      "visual_role": "atmosphere",
+      "density": "字数约30 / 图片0张 / 留白约70%",
+      "anti_pattern": "bullet list under title"
+    },
+    {
+      "index": 2,
+      "title": "目录",
+      "context": "四部分：自我介绍/学习及工作内容/主要工作输出及总结/自我反思及计划",
+      "visual_role": "atmosphere",
+      "density": "字数约60 / 图片0张 / 留白约55%",
+      "anti_pattern": "长段落"
+    },
+    {
+      "index": 3,
+      "title": "自我介绍",
+      "context": "教育经历/工作经历/2026.07入职华为Omni生态与岗位定位",
+      "visual_role": "anchor",
+      "density": "字数约130 / 图片0张 / 留白约40%",
+      "anti_pattern": "纯文字无结构"
+    },
+    {
+      "index": 4,
+      "title": "目录",
+      "context": "第二部分：学习及工作内容介绍",
+      "visual_role": "atmosphere",
+      "density": "字数约30 / 图片0张 / 留白约60%",
+      "anti_pattern": "bullet list"
+    },
+    {
+      "index": 5,
+      "title": "学习及工作内容",
+      "context": "表格分类：个人相关（大数据基础/Agent调研）与工作相关（两个项目）",
+      "visual_role": "evidence",
+      "density": "字数约200 / 图片0张 / 留白约20%",
+      "anti_pattern": "纯文字列表代替表格"
+    },
+    {
+      "index": 6,
+      "title": "目录",
+      "context": "第三部分：主要工作输出及总结",
+      "visual_role": "atmosphere",
+      "density": "字数约30 / 图片0张 / 留白约60%",
+      "anti_pattern": "bullet list"
+    },
+    {
+      "index": 7,
+      "title": "OmniStream项目背景",
+      "context": "openEuler鲲鹏BoostKit Flink Native化加速，解决JVM三瓶颈",
+      "visual_role": "anchor",
+      "density": "字数约180 / 图片0张 / 留白约30%",
+      "anti_pattern": "纯文字无架构图"
+    },
+    {
+      "index": 8,
+      "title": "三仓库双层架构",
+      "context": "OmniStream/OmniAdaptor/OmniOperator双层架构，零侵入接入与算子回退",
+      "visual_role": "evidence",
+      "density": "字数约200 / 图片0张 / 留白约25%",
+      "anti_pattern": "文字堆叠无图"
+    },
+    {
+      "index": 9,
+      "title": "表达式开发总览",
+      "context": "5阶段生命周期+Type ABCD四类分类+codegen与向量化双后端选路",
+      "visual_role": "evidence",
+      "density": "字数约220 / 图片0张 / 留白约20%",
+      "anti_pattern": "平铺直叙无分类"
+    },
+    {
+      "index": 10,
+      "title": "表达式开发案例",
+      "context": "IFNULL别名映射与LEFT-RIGHT向量化、BETWEEN与SIMILAR TO两种策略",
+      "visual_role": "evidence",
+      "density": "字数约220 / 图片0张 / 留白约20%",
+      "anti_pattern": "单一案例无对比"
+    },
+    {
+      "index": 11,
+      "title": "问题排查与方法论",
+      "context": "BETWEEN崩溃定位、vanilla对照组二分法、关键问题与解决方案",
+      "visual_role": "evidence",
+      "density": "字数约200 / 图片0张 / 留白约25%",
+      "anti_pattern": "只讲结论不讲方法"
+    },
+    {
+      "index": 12,
+      "title": "AgentOS项目背景",
+      "context": "九问Agent平台五层架构与一体机办公Agent可编辑产物约束",
+      "visual_role": "anchor",
+      "density": "字数约180 / 图片0张 / 留白约30%",
+      "anti_pattern": "纯文字无架构"
+    },
+    {
+      "index": 13,
+      "title": "4角色流水线架构",
+      "context": "PPT-Agentskill四角色pipeline与产物链路、双层质量保证",
+      "visual_role": "evidence",
+      "density": "字数约220 / 图片0张 / 留白约20%",
+      "anti_pattern": "文字堆叠无图"
+    },
+    {
+      "index": 14,
+      "title": "PPTv2agent参考",
+      "context": "PPTAgent v2/DeepPresenter双agent反思与Content Style五条看齐",
+      "visual_role": "evidence",
+      "density": "字数约200 / 图片0张 / 留白约25%",
+      "anti_pattern": "只列概念不讲关系"
+    },
+    {
+      "index": 15,
+      "title": "skill框架比较",
+      "context": "ppt-pipeline-swarm与标准swarm-skill及PPTv2agent多维对比",
+      "visual_role": "evidence",
+      "density": "字数约220 / 图片0张 / 留白约20%",
+      "anti_pattern": "无对比表格"
+    },
+    {
+      "index": 16,
+      "title": "公式原生插入问题",
+      "context": "OMML可编辑方程需求、三大根因与四次方案迭代",
+      "visual_role": "evidence",
+      "density": "字数约220 / 图片0张 / 留白约20%",
+      "anti_pattern": "只讲方案不讲难点"
+    },
+    {
+      "index": 17,
+      "title": "公式原生插入方案",
+      "context": "inject_omml全链路、OMML XML结构、26公式验证WPS可见零新依赖",
+      "visual_role": "evidence",
+      "density": "字数约220 / 图片0张 / 留白约20%",
+      "anti_pattern": "无验证数据"
+    },
+    {
+      "index": 18,
+      "title": "Wiki产出",
+      "context": "21篇34万字，基础学习/知识拓展/工作指南/工程实践四类",
+      "visual_role": "evidence",
+      "density": "字数约180 / 图片0张 / 留白约30%",
+      "anti_pattern": "罗列文件名"
+    },
+    {
+      "index": 19,
+      "title": "目录",
+      "context": "第四部分：自我反思及下一步学习计划",
+      "visual_role": "atmosphere",
+      "density": "字数约30 / 图片0张 / 留白约60%",
+      "anti_pattern": "bullet list"
+    },
+    {
+      "index": 20,
+      "title": "收获与不足",
+      "context": "工程能力与方法论沉淀；不足在底层深度与实战验证",
+      "visual_role": "anchor",
+      "density": "字数约180 / 图片0张 / 留白约30%",
+      "anti_pattern": "只讲收获不讲不足"
+    },
+    {
+      "index": 21,
+      "title": "下一步学习计划",
+      "context": "OmniStream开发推进、底层深度补齐、Agent工程化实战",
+      "visual_role": "atmosphere",
+      "density": "字数约150 / 图片0张 / 留白约35%",
+      "anti_pattern": "空泛口号"
+    },
+    {
+      "index": 22,
+      "title": "致谢",
+      "context": "感谢评委、导师、直接主管与同事的指导与帮助",
+      "visual_role": "atmosphere",
+      "density": "字数约60 / 图片0张 / 留白约60%",
+      "anti_pattern": "bullet list"
+    }
+  ]
+}

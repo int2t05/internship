@@ -114,33 +114,28 @@ Page
 
 项目背景： OmniStream--基于Flink生态的流处理性能加速项目
 
-- GC 停顿：JVM 堆对象 GC 时 Stop-The-World
-- JIT 预热：字节码先解释执行，攒够热点才编译
-- 序列化开销：Java 对象转字节流，逐条放大
+- GC 停顿打断低延迟
+- JIT 预热慢，热点才编译
+- 序列化逐条放大
 
 ```mermaid
 flowchart LR
-    subgraph Flink["Flink on JVM · 瓶颈根源"]
-        direction TB
-        A1["GC 停顿<br/>堆对象 STW"] --> A2["JIT 预热<br/>解释→热点编译"]
-        A2 --> A3["对象序列化<br/>逐条放大"]
+    subgraph Flink["Flink on JVM · 瓶颈"]
+        A1["GC 停顿"] --> A2["JIT 预热"] --> A3["序列化"]
     end
-    subgraph Omni["OmniStream · C++ Native 对策"]
-        direction TB
-        B1["C++ 算子<br/>堆外 Native 内存"] --> B2["SIMD/SVE 向量化<br/>列式批量算"]
-        B2 --> B3["整链下沉<br/>JNI 每批一次"]
-        B3 --> B4["OmniStateStore<br/>Falcon 缓存降 IO"]
+    subgraph Omni["OmniStream · Native 对策"]
+        B1["C++ 算子"] --> B2["SIMD 向量化"] --> B3["整链下沉"] --> B4["状态缓存"]
     end
     A1 -.消除.-> B1
     A2 -.消除.-> B2
     A3 -.消除.-> B3
-    classDef jvm fill:#FDECEA,stroke:#D9534F,color:#1A2230
-    classDef omni fill:#E8EFF8,stroke:#1E4FA8,color:#1A2230
+    classDef jvm fill:#FDECEA,stroke:#D9534F
+    classDef omni fill:#E8EFF8,stroke:#1E4FA8
     class Flink jvm
     class Omni omni
 ```
 
-OmniStream 是 openEuler + 鲲鹏 BoostKit 大数据 OmniRuntime 生态中面向 Flink 的 Native 化加速项目。核心思路是用 C/C++ 重写 Flink 的 SQL 与 DataStream 算子，配合 AArch64 SIMD/SVE 向量化指令，在不改 Flink 一行代码的前提下端到端提升性能。三瓶颈的共同根源是"JVM 托管执行 + 行式对象模型"，四招对症下药：C++ 写算子消除 JVM 开销、SIMD 列式批量算、整条算子链下沉 Native 减少 JNI 往返、OmniStateStore 缓存降低 RocksDB 磁盘 IO。适配 Flink 1.16.3，当前版本 1.3.0。
+OmniStream 用 C/C++ 重写 Flink 算子，配合 AArch64 向量化指令，在不改 Flink 一行代码的前提下端到端提升性能。
 
 ### Notes:
 
@@ -150,42 +145,34 @@ OmniStream是openEuler社区、华为鲲鹏BoostKit大数据OmniRuntime生态中
 
 三仓库双层架构：Java适配层 + C++核心层
 
-- Java 适配层：拦执行计划 / 判 Native 化 / JNI 初始化 / 不支持回退
-- C++ 核心层：算子、状态、数据流、连接器全在 C++ 闭环
-- 零侵入接入：只改两个配置文件，不改 Flink 内核代码
+- Java 适配层：拦执行计划，判 Native 化，JNI 初始化
+- C++ 核心层：算子/状态/数据流全在 C++ 闭环
+- 零侵入接入：只改两个配置文件，不改 Flink 内核
 
 ```mermaid
 flowchart LR
-    subgraph Adaptor["OmniAdaptor · Java 适配层"]
-        A1["ExecNode 注入<br/>native JSON 描述"]
-        A2["算子替换决策<br/>useomni 判定"]
-        A3["Task 替换<br/>invokable 别名交换"]
-        A1 --> A2 --> A3
+    subgraph Adaptor["OmniAdaptor · Java"]
+        A1["注入 JSON"] --> A2["替换决策"] --> A3["Task 替换"]
     end
-    subgraph Stream["OmniStream · C++ 运行时框架"]
-        B1["OmniTask<br/>Mailbox 单线程模型"]
-        B2["OperatorChain<br/>算子链串行免锁"]
-        B1 --> B2
+    subgraph Stream["OmniStream · C++ 运行时"]
+        B1["OmniTask"] --> B2["OperatorChain"]
     end
-    subgraph Operator["OmniOperator · C++ 向量化内核"]
-        C1["LLVM JIT codegen"]
-        C2["OmniVec 列式格式"]
-        C3["150+ 向量函数"]
-        C1 --> C2 --> C3
+    subgraph Operator["OmniOperator · 向量化内核"]
+        C1["LLVM JIT"] --> C2["OmniVec 列式"] --> C3["150+ 函数"]
     end
-    A3 -->|JNI 每批一次| B1
-    B2 -->|静态链接 .so| C1
-    C3 -->|native ResultPartition| B1
-    Adaptor -.不支持回退.-> F["Flink 原生 Java Runtime<br/>100% 兼容"]
-    classDef java fill:#FFF3E0,stroke:#FFC107,color:#1A2230
-    classDef cpp fill:#E8EFF8,stroke:#1E4FA8,color:#1A2230
-    classDef fb fill:#F7F9FC,stroke:#8B97A8,color:#1A2230
+    A3 -->|JNI| B1
+    B2 -->|.so| C1
+    C3 -->|回流| B1
+    Adaptor -.回退.-> F["Flink 原生 Java"]
+    classDef java fill:#FFF3E0,stroke:#FFC107
+    classDef cpp fill:#E8EFF8,stroke:#1E4FA8
+    classDef fb fill:#F7F9FC,stroke:#8B97A8
     class Adaptor java
     class Stream,Operator cpp
     class F fb
 ```
 
-端到端链路：Flink SQL → OmniAdaptor 在 ExecNode 注入 native JSON 描述并决策算子替换 → OmniTask 替换 invokable class → JNI 调 libtnel.so → C++ Mailbox 驱动算子链 → 经静态链接的 OmniOperator .so 调用向量化内核 → 结果经 native ResultPartition 回流 Flink 网络。JNI 桥接层含 25 个头文件 + 5 个 Bridge 实现类，正向调入算子、反向回调 Checkpoint 物化。
+SQL → OmniAdaptor 注入 JSON 并决策替换 → OmniTask 经 JNI 调 libtnel.so → Mailbox 驱动算子链 → OmniOperator 向量化执行 → 结果回流 Flink。
 
 ### Notes:
 
@@ -195,30 +182,28 @@ flowchart LR
 
 表达式开发总览：让SQL表达式走Native加速路径
 
-- 5 阶段生命周期：规划 → 部署 → 解析 → 编译 → 运行
-- 四类分类体系：Type A 标量函数 / Type B 特殊语法 / Type C 聚合 / Type D 别名
-- 选路公式：优先向量化，不行才 codegen，都不行回退 Java
+- 5 阶段：规划 → 部署 → 解析 → 编译 → 运行
+- 四类：A 标量 / B 特殊语法 / C 聚合 / D 别名
+- 选路：优先向量化，不行才 codegen，都不行回退 Java
 
 ```mermaid
 flowchart TD
-    E["Flink SQL 表达式"] --> P{可向量化?}
-    P -->|是 90%+| V["vectorization<br/>列式 Apply 批量求值"]
-    P -->|否| C{可即时编译?}
-    C -->|是| G["codegen<br/>LLVM JIT 编译成机器码"]
-    C -->|否| J["回退 Flink 原生 Java"]
-    G --> M["ExpressionEvaluator<br/>统一 ExprEval 入口"]
+    E["表达式"] --> P{可向量化?}
+    P -->|是 90%+| V["向量化 Apply"]
+    P -->|否| C{可 JIT?}
+    C -->|是| G["codegen 机器码"]
+    C -->|否| J["回退 Java"]
+    G --> M["ExprEval"]
     V --> M
-    classDef start fill:#E8EFF8,stroke:#1E4FA8,color:#1A2230
-    classDef dec fill:#FFF3E0,stroke:#FFC107,color:#1A2230
-    classDef ok fill:#E8F5E9,stroke:#2E7D32,color:#1A2230
-    classDef bad fill:#FDECEA,stroke:#D9534F,color:#1A2230
-    class E start
-    class P,C dec
+    classDef ok fill:#E8F5E9,stroke:#2E7D32
+    classDef dec fill:#FFF3E0,stroke:#FFC107
+    classDef bad fill:#FDECEA,stroke:#D9534F
     class V,G,M ok
+    class P,C dec
     class J bad
 ```
 
-选路公式：`useCodegen = !(preferVectorization && isSupportVectorization) && isSupportCodegen`。向量化（vectorization/functions/*）是预写列函数 Apply 在列批次上求值，无 JIT 依赖、覆盖广；codegen 是 LLVM JIT 把表达式树编译成机器码，支持表达式融合与内联自动 SIMD。一条表达式从 SQL 到 Native 执行经历五阶段：规划期 RexNodeUtil 识别表达式翻译 JSON AST → 部署期嵌入算子链序列化 JobGraph → 解析期 StreamCalcBatch 的 JSONParser::ParseJSON 转 Expr 树 → 编译期 ExprVerifier 验证后 LLVM CodeGen → 运行期 FilterFunc/ProjFunc 批量向量化执行。
+选路公式：优先向量化，不行才 codegen，都不行回退 Java。
 
 ### Notes:
 
@@ -236,23 +221,23 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    S["开发一个表达式"] --> Q1{普通函数调用?}
-    Q1 -->|是| A["范式 A · 纯向量化函数<br/>functions/*.cpp + Register<br/>不碰 codegen，不建 Expr 节点"]
-    Q1 -->|否 自定义语法| Q2{语义能拆成已有原语?}
-    Q2 -->|是 BETWEEN=≤ AND ≤| B["范式 B · codegen 下放借原语<br/>建 Expr 节点 + lower 到 batch_lessThanEqual<br/>ExprEval Visit 留空 stub"]
-    Q2 -->|否 正则不可拆| C["范式 C · 专用 Expr + 专用函数<br/>建 SimilarFunction VectorFunction<br/>codegen 返回 invalid，ExprEval 调 Apply"]
-    A --> L["标杆: LEFT/RIGHT, IFNULL"]
-    B --> LB["标杆: BETWEEN"]
-    C --> LC["标杆: SIMILAR TO"]
-    classDef a fill:#E8F5E9,stroke:#2E7D32,color:#1A2230
-    classDef b fill:#E8EFF8,stroke:#1E4FA8,color:#1A2230
-    classDef c fill:#FFF3E0,stroke:#FFC107,color:#1A2230
+    S["开发表达式"] --> Q1{普通函数?}
+    Q1 -->|是| A["A 纯向量化<br/>造函数 + 注册"]
+    Q1 -->|否 自定义语法| Q2{能拆原语?}
+    Q2 -->|是| B["B codegen 下放<br/>lower 到原语"]
+    Q2 -->|否| C["C 专用函数<br/>ExprEval 调 Apply"]
+    A --> L["标杆 LEFT/IFNULL"]
+    B --> LB["标杆 BETWEEN"]
+    C --> LC["标杆 SIMILAR TO"]
+    classDef a fill:#E8F5E9,stroke:#2E7D32
+    classDef b fill:#E8EFF8,stroke:#1E4FA8
+    classDef c fill:#FFF3E0,stroke:#FFC107
     class A a
     class B b
     class C c
 ```
 
-三范式判据速记：能拆成已有原语 → 借原语（范式 B，改 codegen，省一个函数但需写 lower 逻辑）；拆不开 → 造函数（范式 C，写 functions/ + 注册，codegen 只需 stub）；普通函数 → 造函数（范式 A，连 Expr 节点都不用建）。IFNULL 语义等价两参 COALESCE，在 specialOperatorMap 加一行映射整链按 COALESCE 走，内核零改动；LEFT/RIGHT 按 UTF-8 码点步进切片绝不切断多字节字符，NULL 由 SimpleFunction 框架 IntersectNull 自动传播；BETWEEN 借 batch_lessThanEqual × 2 + batch_and 组合执行；SIMILAR TO 的正则全匹配引擎无现成原语，造 SimilarFunction 让解释器批量调 Apply。
+判据：能拆原语借原语（B），拆不开造函数（C），普通函数造函数（A）。
 
 ### Notes:
 
@@ -268,24 +253,22 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    B["崩溃现象<br/>BETWEEN 反向区间 low>high"] --> V{原生 Flink 也崩?}
-    V -->|是 投影 CAST 路径| U["上游缺陷<br/>Sarg.isComplementedPoints ←<br/>ImmutableRangeSet.span<br/>Flink 1.16.3 源码 bug"]
-    V -->|否 FILTER 路径| N["本侧 bug<br/>native FilterCodeGen<br/>生成 BetweenExpr 时崩"]
-    U --> R1["处置: 测试主动规避<br/>不做 golden"]
-    N --> R2["处置: 修复 BetweenExpr<br/>codegen"]
-    classDef bug fill:#FDECEA,stroke:#D9534F,color:#1A2230
-    classDef dec fill:#FFF3E0,stroke:#FFC107,color:#1A2230
-    classDef up fill:#F7F9FC,stroke:#8B97A8,color:#1A2230
-    classDef fix fill:#E8F5E9,stroke:#2E7D32,color:#1A2230
-    class B bug
+    B["崩溃: BETWEEN 反向区间"] --> V{原生 Flink 也崩?}
+    V -->|是 投影路径| U["上游缺陷<br/>Flink Sarg 源码 bug"]
+    V -->|否 过滤路径| N["本侧 bug<br/>FilterCodeGen 崩"]
+    U --> R1["规避输入，不做 golden"]
+    N --> R2["修复 BetweenExpr"]
+    classDef bug fill:#FDECEA,stroke:#D9534F
+    classDef dec fill:#FFF3E0,stroke:#FFC107
+    classDef up fill:#F7F9FC,stroke:#8B97A8
+    classDef fix fill:#E8F5E9,stroke:#2E7D32
+    class B,N bug
     class V dec
-    class U up
-    class N bug
-    class R1 up
+    class U,R1 up
     class R2 fix
 ```
 
-开发 BETWEEN 时发现崩溃，但不确定是 Flink/Calcite 上游缺陷还是本侧 native 实现 bug。用 vanilla 做对照组二分法：投影 CAST 路径 vanilla 也崩，异常栈定位到 Flink 1.16.3 源码 Sarg.isComplementedPoints，与 Omni 无关，测试主动规避这类输入；FILTER 路径 vanilla 正常而 native 崩，根因是 native FilterCodeGen 生成 BetweenExpr 时崩，属本侧 bug 已修复。过程中还解决注册名大小写敏感、静默回退、类型错位等工程问题，均沉淀进开发工具与文档。
+用 vanilla 原生 Flink 做对照组：投影路径也崩是 Flink 源码 bug（规避），过滤路径 native 崩是本侧 bug（修复）。
 
 ### Notes:
 
@@ -301,22 +284,20 @@ flowchart TD
 
 ```mermaid
 flowchart BT
-    L1["L1 系统服务底座<br/>openEuler/Ascend 算力"]
-    L2["L2 分布式运行时<br/>状态管理 · 中断恢复"]
-    L3["L3 Agent 框架<br/>agent-core: Spec/Manifest/Harness/Rail"]
-    L4["L4 开发平台 + 技能分发<br/>agent-studio 可视化 · swarm skill"]
-    L5["L5 开箱即用智能体<br/>jiuwenswarm 多智能体协同"]
-    L1 --> L2 --> L3 --> L4 --> L5
-    L5 -.支撑.-> P["一体机办公 Agent<br/>本地化 · 可编辑交付 · WPS 兼容"]
-    classDef base fill:#F7F9FC,stroke:#8B97A8,color:#1A2230
-    classDef core fill:#E8EFF8,stroke:#1E4FA8,color:#1A2230
-    classDef app fill:#E8F5E9,stroke:#2E7D32,color:#1A2230
+    L1["L1 系统服务底座"] --> L2["L2 分布式运行时"]
+    L2 --> L3["L3 Agent 框架<br/>agent-core"]
+    L3 --> L4["L4 开发平台+技能分发"]
+    L4 --> L5["L5 开箱智能体<br/>jiuwenswarm"]
+    L5 -.支撑.-> P["一体机办公 Agent"]
+    classDef base fill:#F7F9FC,stroke:#8B97A8
+    classDef core fill:#E8EFF8,stroke:#1E4FA8
+    classDef app fill:#E8F5E9,stroke:#2E7D32
     class L1,L2 base
     class L3,L4 core
     class L5,P app
 ```
 
-AgentOS 即九问 Agent 平台，提供 Agent 全生命周期"开发 + 运行 + 部署 + 运维"能力，自底向上五层：系统服务底座 → 分布式运行时 → Agent 框架（agent-core：Spec 声明规格 / Manifest 装配清单 / Harness 运行时装配 / Rail 护栏校验）→ 开发平台与技能分发（agent-studio 可视化 + swarm skill 五件套）→ 开箱即用智能体（jiuwenswarm 多智能体协同旗舰）。一体机办公 Agent 把大模型能力做成本地化、可编辑交付的办公智能体，产物必须可编辑是中文办公刚需（走原生 PPT 路线而非图片型导出），本地化部署接一体机模型降本。
+AgentOS 即九问 Agent 平台，提供 Agent 全生命周期能力，自底向上五层，一体机办公 Agent 把大模型能力做成本地化可编辑交付的智能体。
 
 ### Notes:
 
@@ -332,29 +313,17 @@ AgentOS即openJiuwen九问Agent平台，提供Agent全生命周期开发与运�
 
 ```mermaid
 flowchart LR
-    subgraph R1["attachment-reader"]
-        A["MinerU-first 提取<br/>PDF/DOCX/PPTX/XLSX/图像"]
-    end
-    subgraph R2["ppt-planner"]
-        P["大纲结构 + 需求对齐<br/>HITL 两道确认"]
-    end
-    subgraph R3["ppt-researcher"]
-        RE["调研 + 写文稿 + 自审<br/>LaTeX 公式识别"]
-    end
-    subgraph R4["ppt-designer"]
-        D["HTML 幻灯片 + 逐页 QA<br/>html2pptx 生成 .pptx"]
-    end
-    A -->|"attachments/<stem>.md<br/>+ images/"| P
-    P -->|"outline.json"| RE
-    RE -->|"manuscript.md"| D
-    D -->|"slides/ + .pptx"| OUT["交付"]
-    classDef role fill:#E8EFF8,stroke:#1E4FA8,color:#1A2230
-    classDef out fill:#E8F5E9,stroke:#2E7D32,color:#1A2230
-    class R1,R2,R3,R4 role
+    A["attachment-reader<br/>MinerU 提取"] --> P["planner<br/>大纲+对齐"]
+    P -->|"outline.json"| RE["researcher<br/>调研+写稿"]
+    RE -->|"manuscript.md"| D["designer<br/>HTML+QA"]
+    D -->|".pptx"| OUT["交付"]
+    classDef role fill:#E8EFF8,stroke:#1E4FA8
+    classDef out fill:#E8F5E9,stroke:#2E7D32
+    class A,P,RE,D role
     class OUT out
 ```
 
-PPT-Agentskill 是九问平台上的 4 角色专门化流水线（C-pattern pipeline）。单一失败模式是单 agent PPT 生成产出浅、未校验、视觉不一致——一个 agent 无法同时精通文档提取、结构规划、深度研究与视觉设计。Pipeline 强制专门化、校验、用户确认检查点：每阶段产物有固定路径与脚本校验（planner 的 finalize.py 验 JSON 结构 / researcher 的 inspect_manuscript.py + finalize_check.py / designer 的 inspect_slide.py + verify_deck.py），且不得修改上游产物。双层质量保证：脚本硬校验管结构，LLM 自审管语义。还设计了 .trace/ 可观察性体系：每个阶段每个 agent 调用都在工作区按阶段编号落盘完整返回，只读旁路不改变控制流。
+PPT-Agentskill 是九问平台上的 4 角色专门化流水线，强制分工、校验、用户确认检查点，双层质量保证（脚本硬校验 + LLM 自审）。
 
 ### Notes:
 
@@ -370,27 +339,26 @@ PPTv2agent参考：DeepPresenter双Agent架构与Content Style
 
 ```mermaid
 flowchart LR
-    subgraph Researcher["Researcher · 深度检索"]
-        R1["信息加工成半成品"]
-        R2["每页围绕一个核心洞察"]
-        R3["金字塔原则，主题句领起"]
+    subgraph R["Researcher · 深度检索"]
+        R1["半成品非原材料"]
+        R2["每页一核心洞察"]
     end
-    subgraph Presenter["Presenter · 设计生成"]
-        P1["图片承载信息而非填空"]
-        P2["优先可信来源<br/>arxiv/wikipedia/官方"]
+    subgraph P["Presenter · 设计生成"]
+        P1["图承载信息"]
+        P2["优先可信来源"]
     end
-    Researcher -->|"共享观察空间"| Presenter
-    Presenter -->|"渲染像素图"| F["环境接地反思<br/>视觉反馈验证"]
-    F -.->|"反馈修正"| Presenter
-    classDef res fill:#E8EFF8,stroke:#1E4FA8,color:#1A2230
-    classDef pres fill:#E8F5E9,stroke:#2E7D32,color:#1A2230
-    classDef fb fill:#FFF3E0,stroke:#FFC107,color:#1A2230
-    class Researcher res
-    class Presenter pres
+    R -->|"共享观察空间"| P
+    P -->|"渲染像素图"| F["环境接地反思"]
+    F -.->|"反馈修正"| P
+    classDef res fill:#E8EFF8,stroke:#1E4FA8
+    classDef pres fill:#E8F5E9,stroke:#2E7D32
+    classDef fb fill:#FFF3E0,stroke:#FFC107
+    class R res
+    class P pres
     class F fb
 ```
 
-DeepPresenter（PPTAgent v2）是当前学术 SOTA，评测均分 4.44 超越商业系统 Gamma 的 4.36。架构为 Researcher + Presenter 双 Agent 共享观察空间，加环境接地反思——渲染成像素图反馈修正。看齐其信息美学内容风格五条：信息加工成半成品而非原材料、每页围绕一个核心洞察、金字塔原则主题句领起、图片承载信息而非填空、优先可信来源（arxiv/wikipedia/官方）。它是学术参考方法论，PPT-Agentskill 是在九问平台上落地的工程实现，设计器引擎源自其提取重写为独立 CLI。
+DeepPresenter（PPTAgent v2）是当前学术 SOTA，双 Agent 共享观察空间 + 环境接地反思，PPT-Agentskill 是其在九问平台上的工程实现。
 
 ### Notes:
 
@@ -421,16 +389,16 @@ skill框架比较：ppt-pipeline-swarm vs 标准swarm-skill vs PPTv2agent
 
 ```mermaid
 flowchart LR
-    F1["方案 1 · 转图片<br/>全兼容 不可编辑"] -->|迭代| F2["方案 2 · 转换库<br/>WPS 不渲染"]
-    F2 -->|迭代| F3["方案 3 · 重型工具<br/>依赖太重"]
-    F3 -->|最终| F4["方案 4 · 手写解析器<br/>递归下降生成 OMML"]
-    classDef bad fill:#FDECEA,stroke:#D9534F,color:#1A2230
-    classDef ok fill:#E8F5E9,stroke:#2E7D32,color:#1A2230
+    F1["转图片<br/>不可编辑"] -->|迭代| F2["转换库<br/>WPS 不渲染"]
+    F2 -->|迭代| F3["重型工具<br/>依赖太重"]
+    F3 -->|最终| F4["手写解析器<br/>生成 OMML"]
+    classDef bad fill:#FDECEA,stroke:#D9534F
+    classDef ok fill:#E8F5E9,stroke:#2E7D32
     class F1,F2,F3 bad
     class F4 ok
 ```
 
-把公式做成可编辑的原生方程而非图片，是本项目的核心难题。中文办公场景公式必须可编辑非图片截图，且 WPS 兼容是硬约束。三大根因：Python PPT 库不支持原生公式自 2019 至今未解决、PowerPoint 需特殊命名空间包装、WPS 渲染有多个兼容陷阱（不渲染直立体、不认某些包装）。方案经历四次迭代：转图片全兼容但不可编辑、转换库生成 WPS 不渲染、重型工具太重、最终手写递归下降解析器直接生成原生公式 XML，WPS 已验证可见。
+把公式做成可编辑原生方程而非图片，WPS 兼容是硬约束，方案四次迭代最终手写递归下降解析器直接生成 OMML，WPS 验证可见。
 
 ### Notes:
 
@@ -446,19 +414,19 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    R["文稿写公式<br/>LaTeX 识别规范判定"] --> D["设计器标记<br/>data-latex 属性"]
-    D --> C["收集到 sidecar JSON<br/>占位符 + 公式清单"]
-    C --> I["inject_omml 后处理<br/>递归下降生成 OMML XML"]
-    I --> P["PPTX 原生方程<br/>可编辑 · WPS 可见"]
-    classDef doc fill:#E8EFF8,stroke:#1E4FA8,color:#1A2230
-    classDef inject fill:#E8F5E9,stroke:#2E7D32,color:#1A2230
-    classDef out fill:#FFF3E0,stroke:#FFC107,color:#1A2230
+    R["文稿写公式"] --> D["设计器标记<br/>data-latex"]
+    D --> C["收集 sidecar JSON"]
+    C --> I["inject_omml<br/>生成 OMML"]
+    I --> P["PPTX 原生方程"]
+    classDef doc fill:#E8EFF8,stroke:#1E4FA8
+    classDef inject fill:#E8F5E9,stroke:#2E7D32
+    classDef out fill:#FFF3E0,stroke:#FFC107
     class R,D doc
     class C,I inject
     class P out
 ```
 
-最终方案手写递归下降解析器直接生成原生公式 XML，全链路打通且零新增依赖。链路：文稿写公式按识别规范判定 → 设计器用 data-latex 标记 → html2pptx 收集到 sidecar JSON（占位符 + 公式清单）→ build_deck 调 inject_omml 后处理注入原生方程。验证结果：8 种公式类型加 26 个文稿公式全部注入成功，WPS 可见性确认，文件 32KB 远小于图片方案的 96KB。配套公式识别规范决策表与校验脚本从源头保证可正确注入，不支持命令降级为友好文本（如分数变成括号形式）。
+手写递归下降解析器直接生成 OMML，全链路打通零新增依赖，26 公式注入成功 WPS 可见，文件 32KB 远小于图片 96KB。
 
 ### Notes:
 
@@ -474,20 +442,20 @@ Wiki产出：工作指南、知识拓展、基础学习、工程实践21篇
 
 ```mermaid
 flowchart LR
-    A["基础学习 5 篇<br/>框架/机制/原语"] --> B["知识拓展 6 篇<br/>选型/对比/调研"]
-    B --> C["工作指南 2 篇<br/>评测反推生成策略"]
-    C --> D["工程实践 8 篇<br/>根因/原则/验证"]
-    classDef learn fill:#E8EFF8,stroke:#1E4FA8,color:#1A2230
-    classDef ext fill:#E8F5E9,stroke:#2E7D32,color:#1A2230
-    classDef guide fill:#FFF3E0,stroke:#FFC107,color:#1A2230
-    classDef prac fill:#F7F9FC,stroke:#8B97A8,color:#1A2230
+    A["基础学习 5"] --> B["知识拓展 6"]
+    B --> C["工作指南 2"]
+    C --> D["工程实践 8"]
+    classDef learn fill:#E8EFF8,stroke:#1E4FA8
+    classDef ext fill:#E8F5E9,stroke:#2E7D32
+    classDef guide fill:#FFF3E0,stroke:#FFC107
+    classDef prac fill:#F7F9FC,stroke:#8B97A8
     class A learn
     class B ext
     class C guide
     class D prac
 ```
 
-除了项目设计文档和直接代码产出，两个月还沉淀了 21 篇 Wiki 文稿约 34 万字，分四类。基础学习 5 篇解读开源框架平台的内部机制，为项目设计提供底层认知；知识拓展 6 篇横向调研参考项目，为技术选型提供对比依据；工作指南 2 篇从评测标准反推生成策略；工程实践 8 篇记录每次改动的根因、原则、验证，每条改动可追溯到提交。核心数据：8 个分支审计 50 多个提交可追溯，5 个开源项目横向调研，公式方案 26 公式端到端验证，12 套 CSS 模板确定性物化。
+两个月沉淀 21 篇 Wiki 约 34 万字，分四类，8 个分支 50+ commit 可追溯，5 个开源项目横向调研。
 
 ### Notes:
 
@@ -534,7 +502,7 @@ quadrantChart
     "底层深度": [0.25, 0.4]
 ```
 
-两个月实习在工程能力与方法论上显著成长。方法论沉淀包括 vanilla 对照组二分法做 bug 归因、只读旁路可观察性做 trace、纯净原则审计清单做文档质量保障。认知升级：工具是行为约束不只声明能力，隐式交互脆弱需显式强约束，看起来完整不等于真的能用。不足在底层深度不够，对 OmniOperator 最底层向量化内核与编译器实现了解不够清楚；skill 包最大缺口是零实战验证，是最佳实践陈述而非工作流提炼；8 月切入 Agent 项目后 OmniStream 深度推进受限，时间分配需优化。
+工程能力与方法论显著成长，不足在底层深度不够与 skill 包零实战验证。
 
 ### Notes:
 
@@ -550,17 +518,17 @@ quadrantChart
 
 ```mermaid
 flowchart LR
-    A["OmniStream 开发推进<br/>补齐剩余表达式"] --> B["底层深度补齐<br/>向量化内核 + 编译器"]
-    B --> C["Agent 工程化实战<br/>skill 包真实场景跑通"]
-    classDef a fill:#E8EFF8,stroke:#1E4FA8,color:#1A2230
-    classDef b fill:#FFF3E0,stroke:#FFC107,color:#1A2230
-    classDef c fill:#E8F5E9,stroke:#2E7D32,color:#1A2230
+    A["OmniStream 推进"] --> B["底层深度补齐"]
+    B --> C["Agent 工程化实战"]
+    classDef a fill:#E8EFF8,stroke:#1E4FA8
+    classDef b fill:#FFF3E0,stroke:#FFC107
+    classDef c fill:#E8F5E9,stroke:#2E7D32
     class A a
     class B b
     class C c
 ```
 
-围绕三个方向继续提升。OmniStream 开发继续推进补齐剩余表达式类型，推进性能验证与开源贡献；底层深度补齐深入向量化内核与编译器实现，从能用走向吃透；Agent 工程化实战推进 skill 包真实场景跑通，深化公式原生插入的矩阵方程组重音支持扩展。
+围绕三个方向继续提升：OmniStream 推进、底层深度补齐、Agent 工程化实战。
 
 ### Notes:
 

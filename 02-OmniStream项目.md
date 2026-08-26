@@ -1,0 +1,978 @@
+# 实习工作详述 · OmniStream 项目
+
+## 二、OmniStream 项目
+
+### 2.1 项目背景
+
+**OmniStream 是什么**：openEuler 社区 + 华为鲲鹏 BoostKit 大数据 OmniRuntime 生态中面向 Apache Flink 的流计算 Native 化加速项目。核心思路是用 C/C++（Native Code）重写 Flink 的 SQL 与 DataStream 算子，配合 AArch64（鲲鹏）SIMD/SVE 向量化指令，在不改 Flink 一行代码的前提下端到端提升流处理性能。
+
+- 仓库：`gitcode.com/openeuler/OmniStream`（三仓库：OmniStream / OmniAdaptor / OmniOperator）
+- 适配 Flink 1.16.3
+- 当前版本：OmniStream 1.3.0（2026.06.30 发布）
+
+**解决什么问题**：Flink 跑在 JVM 上，高负载下有三类瓶颈，共同根源是"JVM 托管执行 + 行式对象模型"：
+
+1. **GC 停顿** — JVM 堆上大量对象，GC 时 Stop-The-World 打断低延迟
+2. **JIT 预热** — 字节码先解释执行（慢），攒够热点才编译成机器码
+3. **对象序列化** — 数据流转/状态读写/快照时 Java 对象转字节流，逐条处理时被放大
+
+OmniStream 四招对症下药：
+
+| 核心价值       | 怎么做                                                    | 解决的瓶颈               |
+| -------------- | --------------------------------------------------------- | ------------------------ |
+| 消除 JVM 开销  | C++ 写算子，状态/中间数据放堆外 Native 内存               | GC 停顿、JIT 预热        |
+| 向量化计算     | SIMD 指令对列式数据批量算                                 | 单核算力不足             |
+| 减少跨语言开销 | 整条算子链下沉 Native，JNI 从"每条记录一次"降到"每批一次" | 对象序列化、JNI 边界往返 |
+| 状态访问优化   | OmniStateStore（Falcon 缓存）减少 RocksDB 磁盘 IO         | 有状态计算的状态读写     |
+
+### 2.2 三仓库双层架构
+
+概念上"Java 适配层 + C++ 核心层"双层，物理上跨三个独立 git 仓库：
+
+| 仓库         | 职责                                                                                         | 技术栈                                                 | 主要产物                              |
+| ------------ | -------------------------------------------------------------------------------------------- | ------------------------------------------------------ | ------------------------------------- |
+| OmniStream   | Native 运行时框架：Task / OperatorChain / Mailbox / State / Shuffle / SQL 与 DataStream 算子 | C++（CMake, aarch64+SVE, LLVM 15, GCC, PGO）           | libtnel.so                            |
+| OmniAdaptor  | Flink 桥接：算子替换决策、Task 替换、Table Planner 注入 native JSON 描述                     | Java（Maven, Flink 1.16.3）；omnihelper 为 Python 工具 | flink-tnel.jar、omni-table-planer.jar |
+| OmniOperator | 底层向量化内核：算子、表达式、LLVM JIT codegen、OmniVec 列式格式、150+ 函数                  | C++ + Java JNI binding                                 | 5×.so + 2×.jar                      |
+
+**端到端链路**：Flink SQL → OmniAdaptor 在 ExecNode 注入 native JSON 描述 + 决策算子替换 → OmniTask 替换 invokable class → JNI 调 OmniStream libtnel.so → C++ Mailbox 驱动算子链 → 算子内部经静态链接的 OmniOperator .so 调用向量化内核 → 结果经 native ResultPartition 回流 Flink 网络。
+
+**零侵入接入**：只改 Flink 两个配置文件（config.sh 注入 flink-tnel JAR 到 CLASSPATH 前部；flink-conf.yaml 加 java.library.path），不改 Flink 内核代码。不支持的场景自动回退 Flink 原生 Java 执行，保证 100% 兼容。
+
+**核心概念**：
+
+- 双层架构：Java 适配层当"翻译官和守门员"（拦执行计划、判断能不能 Native 化、JNI 初始化、不支持就回退），C++ 核心层是"完整引擎"
+- JNI 桥接层：25 个头文件 + 5 个 Bridge 实现类，双向通信（正向调入算子，反向回调 Checkpoint 物化）
+- Mailbox 单线程模型：所有算子处理和 Checkpoint 在同一线程串行，免锁
+- VectorBatch 列式向量化：继承自 OmniOperator，附加 timestamps/rowKinds
+- OmniStateStore（Falcon 缓存）：状态缓存（LRU），降低 RocksDB 访问频次
+- 算子级回退：不支持的算子不报错，退回 Flink 原生 Java Runtime
+- Nexmark 基准测试：流处理性能基准套件
+
+**版本演进**：
+
+- 2025.06.30 v1.0.0：SQL 实现 Calc/GroupAgg/Join/Deduplicate/Rank/Window/Kafka 算子加速；OmniVec；内存和 RocksDB 状态后端。DataStream 实现 Map/FlatMap/Reduce/Filter/Kafka Source/Sink 加速；UDF 基础框架和翻译基础库
+- 2025.12.30 v1.1.0：SQL 新增 task 级别算子回退机制；DataStream KeyedCoProcess 支持 checkpoint/restore
+- 2026.03.30 v1.2.0：UDF 翻译工具头文件安装；OmniStateStore 加速特性
+- 2026.06.30 v1.3.0：WindowAgg/WindowJoin 算子；Calc 算子支持 UDF 函数注册；Calc 支持 JSON_VALUE/JSON_QUERY/COALESCE/CHAR_LENGTH/TO_TIMESTAMP_LTZ 等内置函数（表达式开发与之相关）
+
+### 2.3 编译流程梳理
+
+**930 分支编译环境**搭建在 `/opt/buildtools` 下。完整编译流程：
+
+1. `mkdir -p /opt/buildtools`
+2. clone `OmniOperator_dependencies` 仓库，提取 `pkg_tmp` 目录
+3. 从 notebook 仓库获取 `install_script` 目录
+4. 分步安装：`install_base.sh` → `install_patch.sh` → JDK → BoostKit（ksl/kaccjson）→ LLVM → googletest → jemalloc → nlohmann_json → snappy → rocksdb → xxhash → rdkafka → boundscheck → abseil_re2
+5. 按顺序构建：OmniOperator（vec）→ OmniAdaptor → OmniStream
+6. **关键注意**：构建 OmniStream 前需关闭 OmniStateStore（`WITH_OMNISTATESTORE=OFF`）
+
+**编译产物分布**：
+
+- OmniAdaptor：`omniop-spark-extension/*`、`flink-tnel-0.1-SNAPSHOT.jar`
+- OmniOperator：`/opt/buildtools/omni_home/omni-operator/lib/`（so 与 IR 文件）
+- OmniStream：头文件、配置文件、动态库装到 `omni_home/omni-operator/` 下
+
+**运行时依赖**：libtnel.so、OmniOperator 的 codegen/operator/vector 三个 so、libboundscheck.so、libLLVM-15.so，以及 xxhash、rdkafka、rocksdb、jemalloc、snappy、re2。
+
+**编译监控技巧**：`pgrep -a make`（看 make 进程）、`top`（看 CPU 负载判断是否还在编译）。
+
+### 2.4 表达式开发
+
+#### 2.4.1 "表达式开发"具体指什么
+
+让 Flink SQL 中的表达式（函数、操作符）走 OmniStream Native 向量化执行路径，替代 Flink 原生 Java 执行，实现性能加速。
+
+一条表达式从 Flink SQL 到 Native C++ 执行的**5 阶段生命周期**：
+
+```
+阶段1 规划期 (Java, OmniAdaptor)    — RexNodeUtil.java 识别表达式 → 翻译为 JSON AST
+阶段2 部署期 (Java, OmniAdaptor)    — JSON AST 嵌入算子链 → 序列化到 JobGraph
+阶段3 解析期 (C++, OmniStream)      — StreamCalcBatch → JSONParser::ParseJSON() → Expr 树
+阶段4 编译期 (C++, OmniOperator)    — ExprVerifier 验证 → ExpressionEvaluator → LLVM CodeGen
+阶段5 运行期 (C++, OmniOperator)    — FilterFunc/ProjFunc 批量向量化执行
+```
+
+#### 2.4.2 表达式开发分类体系（Type A/B/C/D）
+
+| 类型                 | 触发词          | JSON exprType                          | 改动范围                                | 典型示例                 |
+| -------------------- | --------------- | -------------------------------------- | --------------------------------------- | ------------------------ |
+| Type A 标量函数      | 标量函数        | FUNCTION                               | OmniAdaptor + OmniOperator              | REVERSE, MD5, LEFT/RIGHT |
+| Type B 特殊语法      | 自定义 exprType | OmniAdaptor + OmniOperator(jsonparser) | BETWEEN, SIMILAR TO                     |                          |
+| Type C 聚合函数      | 算子级          | aggInfoList                            | OmniAdaptor + OmniStream + OmniOperator | STDDEV_POP               |
+| Type D SQL 变体/别名 | FUNCTION        | 仅 OmniAdaptor                         | IFNULL→COALESCE, UPPER→upper          |                          |
+
+**Type A 的两条子路径**：
+
+| 子路径               | 适用场景                     | 实现位置                          | 标杆                    |
+| -------------------- | ---------------------------- | --------------------------------- | ----------------------- |
+| 向量化（默认，90%+） | 纯列式可向量化、追求吞吐     | vectorization/functions/*.{h,cpp} | LEFT/RIGHT, char_length |
+| row JIT              | 逐行复杂逻辑/外部库/特殊类型 | codegen/functions/*.{h,cpp}       | json_value, md5         |
+
+**Type B 的两种执行策略**：
+
+| 策略                    | 判据                     | 新向量化函数        | 执行路径 | 标杆       |
+| ----------------------- | ------------------------ | ------------------- | -------- | ---------- |
+| B-① codegen 下放借原语 | 语义能拆（如 ≤ AND ≤） | 不需要              | codegen  | BETWEEN    |
+| B-② 专用函数 + 解释器  | 语义需专属逻辑（如正则） | 需要 VectorFunction | ExprEval | SIMILAR TO |
+
+#### 2.4.3 表达式引擎核心原理
+
+**Expr 类体系**（OmniOperator/core/src/expression/expressions.h）：Expr 抽象基类下有 LiteralExpr / FieldExpr / BinaryExpr / UnaryExpr / InExpr / BetweenExpr / IfExpr / SwitchExpr / CoalesceExpr / IsNullExpr / SimilarExpr / FuncExpr 等。
+
+**JSON 序列化协议**：OmniAdaptor 把 Calcite RexCall 翻译成 JSON AST，通用字段 `{exprType, function_name, returnType, arguments, width, precision, scale}`。
+
+**双执行后端 + 统一选路**：
+
+- codegen：LLVM JIT 把表达式树编译成机器码（表达式融合、内联、自动 SIMD）
+- vectorization：预写列向量函数 Apply() 在列批次上求值（无 JIT 依赖、覆盖广）
+- 选路公式：`useCodegen = !(preferVectorization && isSupportVectorization) && isSupportCodegen`（优先向量化，不行才 codegen，都不行回退 Java）
+
+**函数解析四条子路径**：row 函数（codegen 内联）/ 向量化函数（ExprEval 逐元素）/ 内置算子（Expr 节点直接处理）/ Hive UDF（Java 反向回调）
+
+**四类"写代码"的位置**（开发一个表达式到底改哪里，是两个独立问题不是二选一）：
+
+| 问题 | 由什么决定 | 写哪里 |
+|---|---|---|
+| 要不要新建一个向量化函数？ | 语义能否复用已有原语拼出来 | vectorization/functions/*.{h,cpp} + Register*.cpp |
+| 要不要为某个 Expr 节点写 JIT？ | 是不是特殊语法（需要自定义 Expr 节点） | codegen/*.cpp 的 Visit(const XxxExpr&) |
+
+四类代码位置：① vectorization/functions/<Name>.{h,cpp} + Register*.cpp（可复用的向量化函数，列式批量执行，一等公民可被多处复用）；② expression/expressions.{h,cpp} + jsonparser.cpp + expr_visitor/verifier/printer（新建 Expr AST 节点，只在特殊语法不能走通用 FuncExpr 时才需要）；③ codegen/functions/<domain>functions.{h,cpp} + func_registry_<domain>.cpp（row JIT 函数，逐行调用可用 ExecutionContext，给复杂逐行逻辑/需外部上下文用）；④ codegen/batch_expression_codegen.cpp + expression_codegen.cpp（为 Expr 节点写 LLVM JIT 编译逻辑 Visit 方法）。
+
+①③ 都是"造零件"（造函数）：① 列式向量化，③ 逐行 row JIT——普通函数（Type A）二选一（能整列批量→①；需逐行外部上下文→③）。②④ 是"接专线"（为特殊语法 Expr 节点接线）：② 建节点，④ 写节点 JIT 逻辑。普通函数（Type A）动 ① 或 ③；特殊语法（Type B）动 ②，然后视情况动 ①（造 VectorFunction，B-②）或 ④（codegen lower，B-①）。
+
+**三范式决策矩阵**（Type B 内部的 B/C 分叉，即何时写函数、何时改 codegen）：
+
+| 范式 | 何时用 | 新 Expr 节点? | 新向量化函数? | codegen Visit? | 实际执行路径 | 标杆 |
+|---|---|---|---|---|---|---|
+| A 纯向量化函数 | 普通函数调用（LEFT/char_length/concat） | 否（用通用 FuncExpr） | 是 | 否 | ExprEval→Apply | LEFT/RIGHT |
+| B 专用 Expr + codegen 下放 | 特殊语法 + 语义能拆成已有原语 | 是 | 否 | 是（lower 到原语） | codegen | BETWEEN |
+| C 专用 Expr + 专用函数 | 特殊语法 + 语义需专属逻辑 | 是 | 是 | stub（返回 invalid） | ExprEval→Apply | SIMILAR TO |
+
+**决策树**：
+
+```
+开发一个表达式
+│
+是普通函数调用?（SQL 里 func(a,b)，Calcite 当 SqlFunction）
+├─ 是 →【范式 A】只写 functions/*.h/.cpp + Register*.cpp，不碰 codegen，不建 Expr 节点（90%+ 标量函数）
+└─ 否（操作符 BETWEEN/LIKE/SIMILAR TO/IN...）→ 需要自定义 exprType + 新 Expr 节点 + jsonparser + visitor/verifier/printer
+       │
+       语义能拆成已有向量化原语?（如 BETWEEN = lower<=val AND val<=upper）
+       ├─ 是 →【范式 B】不写函数，codegen Visit lower 到原语，ExprEval Visit 留空 stub，执行走 codegen
+       └─ 否 →【范式 C】写 functions/*.h/.cpp + Register*.cpp 注册，ExprEval Visit 调 Apply，codegen Visit 返回 invalid，执行走 ExprEval（解释器）
+```
+
+**判据速记**：能拆成已有原语 → 借原语（范式 B，改 codegen），省一个函数但 codegen 要写 lower 逻辑；拆不开 → 造函数（范式 C，写 functions/），多一个函数文件 + 注册但 codegen 只需 stub；普通函数 → 造函数（范式 A），只造函数连 Expr 节点都不用建。
+
+**为什么 SIMILAR TO 不能像 BETWEEN 那样借原语**：BETWEEN 的 ≤/AND 是引擎里已有的一等向量化原语（batch_lessThanEqual/batch_and），codegen 直接调用即可；SIMILAR TO 的"正则全匹配"引擎里没有现成原语，且 re2 带编译缓存、不适合 row-JIT 内联——所以只能造一个 SimilarFunction（VectorFunction），让解释器批量调它的 Apply。
+
+**部署提醒**：范式 B/C 都新建 Expr 类（头文件加成员/新 virtual 槽）= ABI 破坏，部署前必须 omnistream_incr 重编 OmniStream，否则 ODR/崩溃；范式 A（只造函数，.cpp-only）只需 operator_build + deploy 换 .so，不必重编 OmniStream。
+
+#### 2.4.4 具体开发的表达式（Git 提交记录）
+
+| PR/Commit     | 表达式                    | 类型            | 范式                    | 分支              |
+| ------------- | ------------------------- | --------------- | ----------------------- | ----------------- |
+| !257          | LEFT/RIGHT                | Type A 向量化   | 范式 A 纯向量化函数     | left-right-native |
+| !277          | BETWEEN/NOT BETWEEN       | Type B-①       | 范式 B 借原语走 codegen | between-native    |
+| !280          | IN/NOT IN                 | Type B          | —                      | not-in-native     |
+| !279          | EXISTS/NOT EXISTS         | Type B          | —                      | exists-native     |
+| !300          | PARSE_URL                 | Type A          | —                      | —                |
+| !311          | TYPEOF                    | Type A          | —                      | —                |
+| !312          | WATERMARK                 | 算子级          | —                      | —                |
+| PR#268        | SIMILAR TO/NOT SIMILAR TO | Type B-②       | 范式 C 专用函数走解释器 | similar-to-native |
+| !254          | NOT 运算                  | Type B          | UNARY                   | —                |
+| ifnull-native | IFNULL                    | Type D 别名映射 | 范式 A 别名             | ifnull-native     |
+| !700          | ENCODE                    | Type A          | —                      | —                |
+| !741          | try arithmetic            | 向量化函数      | —                      | —                |
+
+三仓库统一开发分支：`2026_930_poc`；upstream：openeuler/<repo></repo>；fork：int2t/<repo></repo>；托管：gitcode.com。OmniAdaptor 的分支列表直接反映开发的表达式清单：每个表达式一个独立分支，从 upstream/2026_930_poc 切出，独立开发后提 PR。
+
+#### 2.4.5 各表达式实现细节
+
+**ISNULL — Type A 向量化（VectorFunction 路径）**
+
+实现位置：OmniOperator/core/src/vectorization/functions/IsNull.{h,cpp}。IsNullFunction : public VectorFunction，注册在 RegisterMath.cpp:19（非 RegisterPredicate）。
+
+核心实现（IsNull.cpp:14-31）：先 memset 全 false，再从输入向量的 null bitmap 读取 null 位，对 null 行设 raw[i]=true。
+
+```cpp
+class IsNullFunction : public VectorFunction {
+    void Apply(std::stack<BaseVector *> &args, const DataTypePtr &outputType,
+               BaseVector *&result, op::ExecutionContext *context) const override {
+        const auto arg = args.top(); args.pop();
+        const auto raw = unsafe::UnsafeVector::GetRawValues(reinterpret_cast<Vector<bool> *>(result));
+        const auto size = arg->GetSize();
+        memset(raw, 0, size * sizeof(bool));
+        const auto nullBits = reinterpret_cast<uint64_t *>(unsafe::UnsafeBaseVector::GetNulls(arg));
+        SelectivityVector rows(size);
+        rows.setFromBits(nullBits, size);
+        rows.applyToSelected([&](vector_size_t i) { raw[i] = true; });
+    }
+};
+```
+
+注册 23 种参数类型重载（INT/LONG/VARCHAR/DOUBLE/BOOLEAN/SHORT/DECIMAL64/DECIMAL128/DATE32/DATE64/TIME32/TIME64/TIMESTAMP/INTERVAL_MONTHS/INTERVAL_DAY_TIME/CHAR/CONTAINER/BYTE/FLOAT/VARBINARY/ARRAY/MAP/ROW），全部返回 OMNI_BOOLEAN。OmniAdaptor 侧：IS NULL 被 Calcite 展开为 IS_NULL exprType 走 IsNullExpr 路径（jsonparser.cpp:863 → new IsNullExpr(val)）。
+
+**BETWEEN — codegen lower 算法（范式 B 核心）**
+
+codegen lower 算法（batch_expression_codegen.cpp:1747-1816 BatchVisitBetweenExprHelper）：
+
+```cpp
+void BatchVisitBetweenExprHelper(BetweenExpr &bExpr, ...) {
+    // 1. 类型分派
+    if (TypeUtil::IsStringType(...)) params = {OMNI_VARCHAR, OMNI_VARCHAR};
+    else if (OMNI_DATE32) params = {OMNI_INT, OMNI_INT};
+    else if (OMNI_TIMESTAMP) params = {OMNI_LONG, OMNI_LONG};
+    else params = {valueType, valueType};
+    // 2. 调已有原语: batch_lessThanEqual × 2
+    CallExternFunction("batch_lessThanEqual", params, OMNI_BOOLEAN,
+        {lowerVal->data, val->data, *cmpLeft, rowCnt}, ...);  // lower <= val
+    CallExternFunction("batch_lessThanEqual", params, OMNI_BOOLEAN,
+        {val->data, upperVal->data, *cmpRight, rowCnt}, ...);  // val <= upper
+    // 3. NULL 处理: batch_or × 2(检查任一操作数 null)
+    CallExternFunction("batch_or", {OMNI_BOOLEAN}, OMNI_BOOLEAN,
+        {lowerVal->isNull, val->isNull, rowCnt}, ...);
+    CallExternFunction("batch_or", {OMNI_BOOLEAN}, OMNI_BOOLEAN,
+        {lowerVal->isNull, upperVal->isNull, rowCnt}, ...);
+    // 4. AND 合并: batch_and
+    CallExternFunction("batch_and", {OMNI_BOOLEAN}, OMNI_BOOLEAN,
+        {*cmpLeft, *cmpRight, rowCnt}, ...);  // between_pass
+}
+```
+
+Sarg 形态矩阵（RexNodeUtil.java:734-854 handleSearch）：
+
+| Sarg 形态 | 判据 | 产出 |
+|---|---|---|
+| isPoints | 正向点集 | exprType=IN，arguments=[value, ...points] |
+| isComplementedPoints | 补集点集(NOT IN) | exprType=UNARY，operator=NOT，expr=IN(原点集) |
+| 空Sarg | rangeInfo.isEmpty() | LITERAL false |
+| (-inf..+inf) | 单段无界 | LITERAL true |
+| 两段补集 (-inf..low)∪(high..+inf) | NOT BETWEEN | UNARY(NOT, BETWEEN(low,high)) |
+| 单段闭区间 [low..high] | 正常 BETWEEN | exprType=BETWEEN |
+| 半界/其他 | 不可表示 | INVALID |
+
+**SIMILAR TO — SimilarFunction 四函数源码（范式 C 核心）**
+
+SimilarFunction 核心实现（Similar.cpp）：
+
+- Apply（:17-29）：从栈弹 patternVec 和 strVec，调 ApplySimilar
+- ApplySimilar（:31-59）：ConstVector 快路径（patternVec->GetEncoding()==OMNI_ENCODING_CONST → 常量 pattern 整批只编译一次）；逐行 null 输入 → SetNull；否则调 MatchSimilar(str, pattern)
+- SimilarPatternToRegex（:61-105）：SQL SIMILAR → POSIX 正则转换（% → .*、_ → .、\ → \\\\、$ → \$、[...] 字符类内 %/_ → 抛异常；其他字符含 ./^/- 原样传递，re2 理解 POSIX [:class:]）
+- MatchSimilar（:107-128）：re2 全匹配 + 线程级缓存（thread_local std::string cachedPattern + thread_local std::unique_ptr<RE2> cachedRegex；pattern 变化时重编译，编译成功才更新缓存避免失败时 stale cache；RE2::Options opt(RE2::Quiet)，opt.set_dot_nl(true)（SQL % 匹配含换行符）；RE2::FullMatch()（SIMILAR TO 是全匹配非 partial））
+
+注册签名（RegisterRegexp.cpp:17-23）：4 个 VARCHAR/CHAR 组合（{VARCHAR,VARCHAR}/{VARCHAR,CHAR}/{CHAR,VARCHAR}/{CHAR,CHAR} → OMNI_BOOLEAN），因 VectorFunction::Find 精确匹配无隐式转换。NOT SIMILAR TO：Flink sql2rel 展开为 NOT(SIMILAR_TO)，走 UNARY exprType + NOT operator 包裹 SIMILAR_TO。
+
+**NOT IN / EXISTS**
+
+NOT IN（Type B，走 InExpr + UNARY(NOT) 路径）：OmniAdaptor handleSearch（RexNodeUtil.java:760-780）sarg.isComplementedPoints() → exprType=UNARY，operator=NOT，expr=IN(原点集)，原点集从 rangeSet.complement().asRanges() 的 lowerEndpoint() 提取。NULL 列表特殊路径：c IN (1,2,NULL) → Calcite 产出 OR(SEARCH{1,2}, null literal)，NULL 项不在 Sarg 中而是作为独立 OR 分支，三值自动正确（IN found → TRUE(NOT→FALSE)；IN not found & list has NULL → UNKNOWN(NOT→UNKNOWN)；value NULL → UNKNOWN），无需 containsNull 处理。
+
+EXISTS（算子级，非标量表达式）：Flink FlinkSubQueryRemoveRule 把 EXISTS(subquery) 重写为 LogicalJoin(joinType=semi)，NOT EXISTS 重写为 anti。OmniStream 新建 StreamingSemiAntiJoinOperator.{h,cpp}（继承 AbstractStreamingJoinOperator<K>，构造按 joinType 置 isAntiJoin）。OmniAdaptor ValidateJoinOPStrategy.java SUPPORT_JOIN_TYPE 加 LeftSemiJoin/LeftAntiJoin。OmniOperator 零改动。单元测试 StreamingSemiAntiJoinOperatorTest 3 用例全 PASS。
+
+**PARSE_URL / TYPEOF / WATERMARK / ENCODE / try arithmetic**
+
+PARSE_URL（Type A 向量化 SimpleFunction）：RexNodeUtil.java:126 注册 + :148 simpleFunctionNameMap + :220 handleSimpleFunction（通用 handler，生成 exprType=FUNCTION, function_name=parse_url，所有 operands 转发为 arguments）。
+
+TYPEOF（特殊处理，OmniAdaptor 侧直接解析为 LITERAL）：RexNodeUtil.java:130 注册 + :223 handleTypeOf（:1173-1213 取 operands.get(0) 的 LogicalType，调 asSummaryString()，产出 exprType=LITERAL, value=类型字符串）。OmniOperator 侧无需实现（TYPEOF 在 adaptor 侧就解析为常量）。
+
+CURRENT_WATERMARK（特殊处理，读 operator context 无数据参数）：RexNodeUtil.java:115 注册 + :208 handleCurrentWatermark（:1079-1088 期望 1 个 rowtime operand，读 operator context 的 watermark，产出 exprType=LITERAL + watermark 值，无数据 arguments）。
+
+ENCODE（Type A 向量化 SimpleFunction）：OmniOperator/core/src/vectorization/functions/String.h:2242-2269 EncodeFunction，支持 6 种 charset（US-ASCII/ISO-8859-1/UTF-8/UTF-16BE/UTF-16LE/UTF-16 带 BOM）。注册 RegisterString.cpp:62-69，4 个 VARCHAR/CHAR 组合返回 OMNI_VARBINARY。字典 is_support_func:false（未使能）。
+
+try arithmetic（特殊 VectorFunction，Ansi Mode 算术溢出处理）：OmniOperator/core/src/vectorization/functions/TryArithmetic.{h,cpp}，BinaryArithmeticFunction final : public VectorFunction（构造接收 ArithmeticOp operation, ArithmeticEvalMode evalMode, 类型信息）。Apply（TryArithmetic.cpp:360）按 evalMode 分派 ApplyPrimitive<T> / ApplyDecimal，ApplyPrimitive 支持 int8_t/int16_t/int32_t/int64_t/float/double 6 种类型。ArithmeticError enum（:26）溢出检测。
+
+#### 2.4.6 测试用例与报告结果
+
+测试布局：flink-test/test/<name>/{csv,sql}（每个测试一个文件夹）+ self-verification/<name>/（自验证用例）+ report/<name>/<name>.report.md（富报告本地生成）。
+
+流程（3 步）：准备用例（<name>.csv 第一列 row_id，null=NULL，无 header + <name>.sql csv path /tmp/<name>.csv，SET parallelism=1，CREATE TABLE src+sink，INSERT INTO sink SELECT ...）→ 本地驱动（bash run_local.sh <name>，自动 scp 上传 → ssh 跑 native+vanilla+compare → 取回结果）→ 看报告（flink-test/report/<name>/<name>.report.md）。run_local.sh 流程：scp 上传 csv+sql+run_test.sh+compare.sh+env.sh 到 /tmp/ → ssh 跑 run_test.sh（native+vanilla+compare，约 2-3 分钟，多次重启集群）→ 本地组装报告（解析 @@@<SECTION>@@@ 结构化输出：META/WELCOME/NATIVE_OUT/VANILLA_OUT/DIFF/VERDICT）。
+
+通过判据（双重）：① native == vanilla 归一化后逐行一致（IDENTICAL）；② welcome to native 计数 > 0（OmniTask.cpp:315）。归一化对比（compare.sh）：去 +I 前缀/方括号/空格，逗号→|，排序后 diff。
+
+各表达式测试报告结果：
+
+| 表达式 | 测试目录 | welcome to native | native vs vanilla | 结论 |
+|---|---|---|---|---|
+| LEFT | flink-test/test/left/ | 0→1 | 8 行归一化 IDENTICAL | PASS |
+| RIGHT | flink-test/test/right/ | 0→1 | 8 行归一化 IDENTICAL | PASS |
+| BETWEEN | flink-test/test/between/ | 0→0 | native 9 行正确 | FAIL（vanilla 基线缺失，config.sh PATCH 移除致 vanilla 未跑，非 native bug） |
+| SIMILAR TO | flink-test/test/similar_to/ | 0→2 | 12 行 vs 11 行归一化 IDENTICAL | PASS |
+| IFNULL | flink-test/test/ifnull/ | 0→1 | 4 行归一化 IDENTICAL | PASS |
+| NOT IN | flink-test/test/not-in/ | — | — | — |
+| EXISTS | flink-test/test/exists/ | — | 单元测试 3 用例全 PASS | PASS |
+
+self-verification 目录：flink-test/self-verification/{between,left_right,similar_to,ifnull,in_not_in,exists,like_not_like}/。
+
+BOOLEAN 返回表达式的两条测试路径：向量化路径（WHERE bool_expr FILTER，输出非 bool 列，ExprEval::Visit → VectorFunction::Apply）；codegen 回退路径（CAST(bool_expr AS INT) 投影 1/0/null，CAST→CASE→SWITCH_GENERAL→codegen）。CAST(BOOLEAN AS INT) 被 Flink planner 改写成 CASE(IS NOT NULL(b), CASE(b,1,0), null) → SWITCH_GENERAL → SwitchExpr 不设 vectorFunction → 走 codegen。
+
+Sink 类型限制：SINK_SUPPORT_DATA_TYPE（OmniGraphOverride.java:215）仅 BIGINT/INTEGER/VARCHAR(各宽度)/STRING/TIMESTAMP(0-3,9)/TIMESTAMP_LTZ(3)/DECIMAL64/DECIMAL128，不含 DOUBLE/BOOLEAN/CHAR。超出则 isSinkSupportNative=false → 整链静默回退 vanilla（welcome=0，无错误日志）。
+
+### 2.5 表达式开发案例
+
+> 所有表达式经同一套四层管线（通用四层模型）：Layer 1 OmniAdaptor 构建 JSON（RexNode → native JSON，改写/序列化唯一发生地）→ Layer 2 OmniAdaptor 决策+JNI（Sink 类型门控 + 表达式校验 + useomni + Task 替换 + JNI 入口）→ Layer 3 OmniStream C++ 运行时（JNI 桥 → OmniTask → mailbox → StreamCalcBatch → 落盘）→ Layer 4 OmniOperator C++ 向量化执行（JSON 解析 → Expr → 向量化执行，表达式语义内核）。Layer 2/3 为共享管线与具体表达式无关，Layer 1/4 随表达式语义不同。
+
+#### 案例 1：IFNULL — Type D 别名映射（范式 A）
+
+**一句话结论**：IFNULL(a, b) 语义等价于两参 COALESCE(a, b)。在 OmniAdaptor RexNodeUtil.specialOperatorMap 加一行 `"IFNULL" → SpecialExprType.COALESCE`，此后整条链路按 COALESCE 走，OmniOperator 零改动（本就支持 COALESCE）。改写只发生在 OmniAdaptor 构建 native JSON 时。
+
+**四层流程**：
+
+- Layer 1（OmniAdaptor 构建 JSON，omni-table-planner 仓库）：resolveOperatorType 查 specialOperatorMap 命中 SpecialExprType.COALESCE（IFNULL 别名）→ switch case COALESCE → 产出 COALESCE 节点。**这是三仓库中唯一出现 IFNULL 字样的地方**，之后一律按 COALESCE。别名映射源码（RexNodeUtil.java:100-102）：
+
+```java
+specialOperatorMap.put("COALESCE", SpecialExprType.COALESCE);
+// IFNULL reuses the COALESCE native path (equivalent to 2-arg COALESCE)
+specialOperatorMap.put("IFNULL", SpecialExprType.COALESCE);
+```
+
+case COALESCE 构建 JSON 节点（RexNodeUtil.java:320-350，IFNULL 恰好 2 个操作数，循环只跑一次）：
+
+```java
+case COALESCE:
+    for (int i = operands.size() - 1; i >= 1; i--) {
+        Map<String,Object> node = new LinkedHashMap<>();
+        node.put("exprType", "COALESCE");
+        setDataType(rexCall, node, "returnType");              // returnType = OmniType id
+        node.put("value1", buildJsonMap(operands.get(i - 1))); // 操作数0
+        node.put("value2", buildJsonMap(operands.get(i)));     // 操作数1
+        nested = node;
+    }
+    break;
+```
+
+产出 JSON 形态：`IFNULL(c_int, 5)` → `{exprType:COALESCE, returnType:1, value1:{exprType:FIELD_REFERENCE,dataType:1,colVal:<c_int偏移>}, value2:{exprType:LITERAL,dataType:1,isNull:false,value:"5"}}`。此即 Layer 4 ParseJSONCoalesce（jsonparser.cpp:564）期待的 exprType=="COALESCE" 契约。
+
+- Layer 2（OmniAdaptor 决策+JNI，flink-tnel 仓库，本层与表达式无关，LEFT/RIGHT/IFNULL 共享）：决策流程——JobGraph → Sink 类型在 SINK_SUPPORT_DATA_TYPE 白名单？（OmniGraphOverride.java:215-229，含 BIGINT/INTEGER/VARCHAR/STRING 等，不含 DOUBLE/BOOLEAN/CHAR；否则 useomni=false 静默回退 vanilla）→ ValidateCalcOPStrategy 遍历 indices 校验 → 按 exprType 分发 → case "COALESCE" 校验三键存在 + 递归校验 value1/value2 → setUseOmniEnabled(true) 写 useomni → OmniTask 替换 Task（invokable 别名交换 OneInputStreamTask → OmniOneInputStreamTaskV2，OmniTask.java:565-569）→ JNI 提交 JSON 给 libtnel.so（submitTaskNativeWithCheckpointing，OmniTaskExecutor.java:405；libtnel.so 在 TM 启动时加载 TNELLibrary.java:69）。显式 case "COALESCE" 校验源码（ValidateCalcOPStrategy.java:372-379）：
+
+```java
+case "COALESCE":
+    if (!exprMap.containsKey("returnType") || !exprMap.containsKey("value1")
+            || !exprMap.containsKey("value2")) { return false; }
+    return validateCalcExprMaps(inputSize, "COALESCE",
+        exprMap.get("value1"), exprMap.get("value2"));  // 递归校验两个操作数
+```
+
+- Layer 3（OmniStream 运行时）：JNI 桥 → OmniTask → mailbox → StreamCalcBatch → 落盘（StreamOperatorFactory.cpp:365-366 WRITE_TO_FILE 门控）
+- Layer 4（OmniOperator 向量化执行）：jsonparser.cpp:564 ParseJSONCoalesce → CoalesceExpr（expressions.cpp:957-958 构造期 VectorFunction::Find 命中 functionMap_）→ ExprEval.cpp:502-514 Visit(CoalesceExpr) → CoalesceFunction::Apply → Coalesce.cpp:73-114 逐行 IsNull 选第一个非 NULL
+
+**Layer 4 内核源码**（Coalesce.cpp:73-93，逐行标量循环，无 SIMD，"向量化"= 一次处理一列 BaseVector）：
+
+```cpp
+template<typename T>
+void CoalesceNumeric(const vector<BaseVector*>& argVectors, BaseVector*& result, ...) {
+    for (int32_t row = 0; row < size; ++row) {
+        bool found = false;
+        for (size_t argIdx = 0; argIdx < argVectors.size(); ++argIdx) {
+            if (!argVectors[argIdx]->IsNull(row)) {             // 操作数非 NULL
+                SetValueToVector(result, row, GetValueFromVector<T>(argVectors[argIdx], row));
+                found = true; break;                            // 取第一个非 NULL，跳出
+            }
+        }
+        if (!found) { result->SetNull(row); }                   // 皆 NULL → 结果 NULL
+    }
+}
+```
+
+DispatchCoalesce 按输出类型路由：IsStringType → CoalesceString（string_view）；OMNI_INT → CoalesceNumeric<int32_t>；OMNI_LONG → CoalesceNumeric<int64_t>。**COALESCE 自己逐行 IsNull 判断**，这与 LEFT/RIGHT 由 SimpleFunction 框架自动传播 NULL 形成对照。
+
+**注册**：RegisterConditional.cpp:54-74 用 RegisterVectorFunction 把 coalesce 按各类型签名（{INT,INT}/{LONG,LONG}/{VARCHAR,VARCHAR} 等）注册进 functionMap_。每个 ExpressionEvaluator 构造时触发注册。
+
+**测试用例**（flink-test/test/ifnull/，2026-07-17 验证 PASS，native == vanilla 逐行一致）：
+
+SQL：`SELECT row_id, IFNULL(c_int, 5), IFNULL(c_bigint, 100), IFNULL(c_str, c_def) FROM src`
+
+输入 CSV（csv.null-literal='null'）：
+
+```
+r01,10,100,abc,def      -- 全非 NULL
+r02,null,null,null,def  -- 全 NULL → 替换值
+r03,20,200,xyz,def      -- 全非 NULL
+r04,30,null,null,def    -- 部分 NULL
+```
+
+期望输出：
+
+| row_id | IFNULL(c_int,5) | IFNULL(c_bigint,100) | IFNULL(c_str,c_def) |
+| ------ | --------------- | -------------------- | ------------------- |
+| r01    | 10              | 100                  | abc                 |
+| r02    | 5               | 100                  | def                 |
+| r03    | 20              | 200                  | xyz                 |
+| r04    | 30              | 100                  | def                 |
+
+验证判据：① TM .out 出现 welcome to native（OmniTask.cpp:315）；② native 输出 4 行与 vanilla 逐行一致（归一化后 IDENTICAL）。
+
+类型选择说明：仅用 native Sink 支持的类型（SINK_SUPPORT_DATA_TYPE：BIGINT/INTEGER/VARCHAR/STRING/TIMESTAMP/DECIMAL）；replacement 用 STRING 列 c_def（非字面量），避免 CHAR 字面量致 IFNULL 返回 CHAR（native 不支持）及 CAST 运行时风险。
+
+**单行数据完整旅程**（以 r02 为例，c_int/c_bigint/c_str 全 NULL，c_def="def"）：
+
+输入行：`r02,null,null,null,def`
+
+| 阶段 | 数据形态 | 结果 |
+|---|---|---|
+| CSV 读入 | VectorBatch 5 列：row_id="r02", c_int=NULL, c_bigint=NULL, c_str=NULL, c_def="def" | — |
+| 向量化求值 | Evaluate 对 4 个投影各跑一次 VisitExpr（row_id 直通 + 三个 COALESCE 的 CoalesceExpr） | — |
+| IFNULL(c_int,5) | Visit(CoalesceExpr)：push c_int 列(含 NULL) + push ConstVector(5)；CoalesceNumeric<int32_t>：c_int NULL → 取 5 | 5 |
+| IFNULL(c_bigint,100) | 同上 → CoalesceNumeric<int64_t>：c_bigint NULL → 取 100 | 100 |
+| IFNULL(c_str,c_def) | Visit(CoalesceExpr)：push c_str(含 NULL) + push c_def("def")；CoalesceString：c_str NULL → 取 c_def="def" | "def" |
+| 投影输出 | (r02, 5, 100, def, +I) | — |
+| Sink | 写 +I,r02,5,100,def | — |
+
+最终 /tmp/flink_output.txt 含 +I,r02,5,100,def，与 vanilla 逐行一致。其余三行同理：r01/r03 全非 NULL → COALESCE 取 value1 原值；r04 c_int 非 NULL(取 30)、c_bigint/c_str NULL(取替换值 100/def)。
+
+#### 案例 2：LEFT/RIGHT — Type A 真正 native 函数（范式 A 纯向量化）
+
+**一句话结论**：LEFT 和 RIGHT 是镜像的真正 native 字符串函数（不像 IFNULL 别名映射到 COALESCE）。两者共享同一条 native 化路径——FUNCTION 族 JSON → FuncExpr → SimpleFunction 框架，唯一差异在最后的切片算法：LeftFunction 取前 n 码点，RightFunction 取后 n 码点。仓库基线：OmniAdaptor left-right-native / OmniStream 2026_930_poc / OmniOperator left-right-native（2026-07-17）。
+
+**LEFT vs RIGHT 差异（仅此三处，其余四层流程完全一致）**：
+
+| # | 位置                  | LEFT                                             | RIGHT                                                                   |
+| - | --------------------- | ------------------------------------------------ | ----------------------------------------------------------------------- |
+| 1 | Layer 1 JSON          | case LEFT RexNodeUtil.java:602-610               | case RIGHT :611-619                                                     |
+| 2 | Layer 1 function_name | "left"                                           | "right"                                                                 |
+| 3 | Layer 4 切片算法      | LeftFunction::doCall String.h:645-657，前 n 码点 | RightFunction::doCall String.h:678-692，后 n 码点（先算总码点再算偏移） |
+
+**四层流程**：
+
+- Layer 1（OmniAdaptor 构建 JSON）：RexNodeUtil.java:602-619 case LEFT/RIGHT → `{exprType:FUNCTION, function_name:left/right, arguments:[s,n]}`
+- Layer 2（OmniAdaptor 决策+JNI）：Sink 门控 + ValidateCalcOPStrategy.java:276-370 通用 case "FUNCTION" 结构校验（**不查函数名**，只查结构）+ useomni + Task 替换 + JNI
+- Layer 3（OmniStream 运行时）：同 IFNULL
+- Layer 4（OmniOperator 向量化执行）：jsonparser.cpp:570-571 ParseJSONFunc → FuncExpr（expressions.cpp:1058 构造期 VectorFunction::Find 命中 simpleFunctionFactoryMap_）→ ExprEval.cpp:527-565 Visit(FuncExpr) → SimpleFunction::Apply → doApplyNotNull → call → LeftFunction/RightFunction 逐行 Unicode 切片
+
+**Layer 4 切片算法源码**（String.h，两者均用 cappedByteLengthUnicode 按 UTF-8 码点步进，绝不切断多字节字符）：
+
+```cpp
+// String.h  LeftFunction::doCall(:645) —— 取最左 n 码点
+bool doCall(string &result, string_view input, int64_t length) {
+    if (length <= 0) { result.clear(); return true; }            // n<=0 → 空串
+    int64_t byteLen = cappedByteLengthUnicode(input, size, length);  // 走 length 个码点
+    result.assign(input.data(), byteLen);                        // 最左切片
+    return true;
+}
+
+// String.h  RightFunction::doCall(:678) —— 取最右 n 码点
+bool doCall(string &result, string_view input, int64_t length) {
+    if (length <= 0) { result.clear(); return true; }            // n<=0 → 空串
+    int64_t numChars = length<false>(input);                     // 总码点数
+    int64_t take = min(length, numChars);                        // 钳到整串
+    int64_t skipChars = numChars - take;                         // 从左跳过的码点数
+    int64_t startByte = cappedByteLengthUnicode(input, size, skipChars);  // 跳过码点 → 字节偏移
+    result.assign(input.data() + startByte, size - startByte);   // 最右切片
+    return true;
+}
+```
+
+**切片示例**：LEFT/RIGHT("你好world", 3)——7 码点（你,好,w,o,r,l,d）、11 字节。
+
+- LEFT：cappedByteLengthUnicode(..., 3) = 7（你3+好3+w1）→ 你好w
+- RIGHT：numChars=7、take=3、skipChars=4、startByte=cappedByteLengthUnicode(...,4) = 8（你3+好3+w1+o1）→ assign(data+8, 3) = rld
+
+**NULL 处理**：LeftFunction/RightFunction 无 callNullable，NULL 全由 SimpleFunction 框架 IntersectNull 自动传播。框架伪代码：
+
+```text
+SimpleFunction::Apply(args, result):
+  for 每个参数 arg:
+    IntersectNull(arg)              # 任一参数为 NULL 的行剔出活动集
+  result 的 null buffer ← 活动集取反    # 剔除行 → 结果 NULL
+  for 存活行(全非 NULL):
+    LeftFunction/RightFunction.call(result, input, length)   # 只对存活行调用
+```
+
+任一入参 NULL → 该行被剔除 → 结果 NULL，call 根本不调用。空串 vs NULL 易混淆：n<=0 时返回空串（IsNull=false），落盘行尾只剩逗号；仅当任一入参为 NULL 时才写 NULL。
+
+**注册**：RegisterString.cpp:70-88 用 RegisterFunction 模板把 left/right 各 4 个签名（{VARCHAR,INT}/{VARCHAR,LONG}/{CHAR,INT}/{CHAR,LONG} → VARCHAR）注册进 simpleFunctionFactoryMap_。注册名是裸串 "left"/"right"（prefix=""），必须与 JSON 的 function_name 一致。每个 ExpressionEvaluator 构造时触发注册。
+
+**测试用例**（flink-test/test/left/、flink-test/test/right/，2026-07-17，native == vanilla）：
+
+SQL：`SELECT row_id, LEFT(s, n) AS r FROM src`（RIGHT 同理）
+
+输入 CSV（LEFT/RIGHT 相同）：
+
+```
+r01,hello,2        -- n=2,正常
+r02,hello,0        -- n=0 → 空串
+r03,hello,-1       -- n<0 → 空串
+r04,hello,10       -- n>=len → 整串
+r05,hello,5        -- n=len → 整串
+r06,null,3         -- s=NULL → NULL
+r07,hello,null     -- n=NULL → NULL
+r08,你好world,3    -- Unicode:7 码点/11 字节
+```
+
+期望输出对照：
+
+| row_id | s         | n    | LEFT(s,n) | RIGHT(s,n) | 说明           |
+| ------ | --------- | ---- | --------- | ---------- | -------------- |
+| r01    | hello     | 2    | he        | lo         | 前 / 后 2 字符 |
+| r02    | hello     | 0    | （空串）  | （空串）   | n<=0 → 空串   |
+| r03    | hello     | -1   | （空串）  | （空串）   | n<0 → 空串    |
+| r04    | hello     | 10   | hello     | hello      | n>=len → 整串 |
+| r05    | hello     | 5    | hello     | hello      | n=len → 整串  |
+| r06    | NULL      | 3    | NULL      | NULL       | s=NULL         |
+| r07    | hello     | NULL | NULL      | NULL       | n=NULL         |
+| r08    | 你好world | 3    | 你好w     | rld        | Unicode 计字符 |
+
+验证判据：① TM .out 出现 welcome to native；② native 输出 8 行与 vanilla 逐行一致。
+
+**速查**：JSON 改写唯一发生地 RexNodeUtil.java:602-619；校验放行 ValidateCalcOPStrategy.java:276-370；native 切片内核 String.h:645-657（Left）/ String.h:678-692（Right）；落盘门控 StreamOperatorFactory.cpp:365-366。
+
+#### 案例 3：BETWEEN vs SIMILAR TO — Type B 两种策略对照
+
+| 维度             | BETWEEN（B-① 借原语）                                             | SIMILAR TO（B-② 专用函数）                 |
+| ---------------- | ------------------------------------------------------------------ | ------------------------------------------- |
+| 选择依据         | 语义可拆成 ≤ AND ≤                                               | 正则不可拆，需专属逻辑                      |
+| 新 Expr 节点     | BetweenExpr                                                        | SimilarExpr                                 |
+| 新向量化函数     | 不需要                                                             | SimilarFunction（VectorFunction，re2 正则） |
+| 注册             | 不注册                                                             | RegisterRegexp.cpp 注册 similar_to          |
+| ExprEval Visit   | 空 stub                                                            | 调 Apply（活）                              |
+| codegen Visit    | lower 到原语 batch_lessThanEqual×2 + batch_and（活）              | 返回 invalid（stub）                        |
+| 执行路径         | codegen                                                            | 解释器（ExprEval）                          |
+| OmniAdaptor 入口 | case SEARCH（Calcite 把 BETWEEN 优化成 Sarg）→ exprType:"BETWEEN" | specialOperatorMap + case SIMILAR_TO        |
+| 部署影响         | 新 Expr 类 = ABI 破坏，需 omnistream_incr 重编 OmniStream          | 同上                                        |
+
+**SIMILAR TO 为什么用 VectorFunction 而非 SimpleFunction**：re2 编译昂贵，需批级缓存（thread_local 缓存编译后的 RE2）；ConstVector 快路径（常量 pattern 整批只编译一次）；架构硬接：SimilarExpr 构造 VectorFunction::Find 只查 functionMap_；判据：每行算要不要"整批共享昂贵 setup"？要→VectorFunction；不要→SimpleFunction。
+
+**BETWEEN 改了哪些文件（范式 B，借原语不写函数）**：
+
+| 仓库 | 文件 | 做了什么 |
+|---|---|---|
+| OmniAdaptor | RexNodeUtil.java case SEARCH（:577） | Calcite 把 BETWEEN 优化成 SEARCH(x, Sarg[a..b])，在此识别闭区间→产出 exprType:"BETWEEN"（value/lower_bound/upper_bound） |
+| OmniOperator | expressions.h:333 BetweenExpr | 新 Expr 节点（value/lowerBound/upperBound） |
+| OmniOperator | jsonparser.cpp:560/239 | 解析 BETWEEN→BetweenExpr |
+| OmniOperator | ExprEval.cpp:486 | 空 stub：void Visit(const BetweenExpr &e) {}——解释器路径不实现 |
+| OmniOperator | batch_expression_codegen.cpp:1741 BatchVisitBetweenExprHelper | codegen lower：batch_lessThanEqual×2（:1793-1794）+ batch_and（:1803）+ batch_or 处理 null |
+| OmniOperator | expr_verifier.cpp:221 | vectorFunction==nullptr→isSupportVectorization_=false（禁用解释器，走 codegen） |
+
+关键特征：没有 functions/Between.h/.cpp，没有在 Register*.cpp 注册 between 函数；codegen 是活的（lower 到原语），ExprEval 是死的（空）；执行走 codegen 路径，借了 batch_lessThanEqual + batch_and 两个已有原语。
+
+**SIMILAR TO 改了哪些文件（范式 C，完整链路写专用函数）**：
+
+| 仓库 | 文件 | 做了什么 |
+|---|---|---|
+| OmniAdaptor | RexNodeUtil.java:109/246/674 | specialOperatorMap.put("SIMILAR TO",...) + 枚举 + case SIMILAR_TO→exprType:"SIMILAR_TO"（value/pattern）；3 参带 ESCAPE→INVALID 回退 |
+| OmniAdaptor | ValidateCalcOPStrategy.java:422 | case "SIMILAR_TO": 校验 |
+| OmniAdaptor | flink_function_dictionary.json:61 | SIMILAR TO/NOT SIMILAR TO→is_support_func:true |
+| OmniOperator | expressions.h:485 SimilarExpr | 新 Expr 节点（value/pattern）；构造函数 expressions.cpp:1016-1024 用 FunctionSignature("similar_to",...)+VectorFunction::Find 查找已注册的 SimilarFunction 存入 vectorFunction |
+| OmniOperator | jsonparser.cpp:590/424 | 解析 SIMILAR_TO→SimilarExpr |
+| OmniOperator | functions/Similar.h + Similar.cpp（新文件） | class SimilarFunction : public VectorFunction：Apply() 把 SQL SIMILAR 模式翻译成 POSIX 正则（re2）逐行全匹配，线程级编译缓存（SimilarPatternToRegex/MatchSimilar） |
+| OmniOperator | RegisterRegexp.cpp:17-18 | RegisterVectorFunction("similar_to", {OMNI_VARCHAR,OMNI_VARCHAR}, OMNI_BOOLEAN, similarFunction) 注册进 functionMap_ |
+| OmniOperator | ExprEval.cpp:527-537 | Visit(const SimilarExpr&) 调 e.vectorFunction->Apply(...)——解释器路径是活的（对比 BETWEEN 的空 stub） |
+| OmniOperator | expression_codegen.cpp:804 + batch_expression_codegen.cpp:481 | codegen Visit 返回 CreateInvalidCodeGenValue()——codegen 不实现，回退解释器 |
+| OmniOperator | expr_verifier.cpp:300 | vectorFunction 非空（SimilarFunction 已注册）→isSupportVectorization_=true（走解释器） |
+| OmniOperator | SimilarTest.cpp（新文件） | 单测 |
+
+关键特征：有 functions/Similar.h/.cpp（专用函数），有 RegisterRegexp.cpp 注册 similar_to；ExprEval 是活的（调 Apply），codegen 是 stub（返回 invalid）；执行走解释器路径（ExprEval→SimilarFunction::Apply），没借任何已有原语，自己写了 re2 全匹配。
+
+#### IFNULL→COALESCE vs LEFT/RIGHT 完整对照
+
+| 维度              | IFNULL→COALESCE                              | LEFT/RIGHT                                       |
+| ----------------- | --------------------------------------------- | ------------------------------------------------ |
+| 上游改写          | IFNULL→COALESCE 别名（RexNodeUtil.java:102） | 无（case LEFT/RIGHT 直接产 FUNCTION）            |
+| JSON exprType     | COALESCE（专用）                              | FUNCTION（通用族）                               |
+| JSON 参数键       | value1/value2                                 | arguments 数组                                   |
+| jsonparser 分支   | ParseJSONCoalesce（:564）                     | ParseJSONFunc（:570）                            |
+| Expr 类           | CoalesceExpr                                  | FuncExpr                                         |
+| 向量化注册表      | functionMap_（直接注册）                      | simpleFunctionFactoryMap_（SimpleFunction 框架） |
+| 校验              | 显式 case "COALESCE":                         | 通用 case "FUNCTION": 不查函数名                 |
+| NULL 处理         | CoalesceFunction 逐行 IsNull                  | 框架 IntersectNull 自动                          |
+| OmniOperator 改动 | 零改动（本就支持 COALESCE）                   | 专用 LeftFunction/RightFunction                  |
+
+### 2.6 问题排查与解决方案
+
+#### 问题 1：BETWEEN 崩溃到底是"上游的锅"还是"自己的锅"
+
+**问题**：开发 BETWEEN 时发现崩溃——反向无效区间 between(low, high) 且 low > high 时触发崩溃。但不确定是 Flink/Calcite 上游逻辑缺陷，还是 Omni 侧 native 实现 bug。
+
+**方法**：用 vanilla（原生 Flink）做对照组的二分法——把同一用例同时跑在 vanilla 和 native 上对比。
+
+结果分两类：
+
+- **投影 CAST 路径**（CAST(c BETWEEN ... AS INT)）：vanilla 同样崩溃，异常栈在 Sarg.isComplementedPoints ← ImmutableRangeSet.span ← SearchOperatorGen.generateSearch。是 Flink 1.16.3 源码 bug，与 Omni 无关。测试主动规避这类输入，不做 golden。
+- **FILTER 路径**（WHERE c BETWEEN ...）：vanilla 正常、native 崩溃，根因是 native FilterCodeGen 生成 BetweenExpr 时崩。属于自己的 bug，修复。
+
+用例分类与根因分析表：
+
+| 用例                    | 表达式                                          | vanilla | native | 根因                                |
+| ----------------------- | ----------------------------------------------- | ------- | ------ | ----------------------------------- |
+| ASYM low>high proj      | CAST(c BETWEEN 20 AND 10 AS INT)                | 崩      | 崩     | Flink bug：空 Sarg                  |
+| SYM low>high proj       | CAST(c BETWEEN SYMMETRIC 20 AND 10 AS INT)      | 崩      | 崩     | Flink bug：SYM 反向臂空 Sarg        |
+| SYM in-range proj       | CAST(c BETWEEN SYMMETRIC 10 AND 20 AS INT)      | 崩      | 崩     | Flink bug：SYM 反向臂空 Sarg        |
+| INT ASYM in filter      | WHERE c BETWEEN ASYMMETRIC 10 AND 20            | 12,20   | 崩     | native FilterCodeGen BetweenExpr 崩 |
+| INT SYM in filter       | WHERE c BETWEEN SYMMETRIC 10 AND 20             | 12,20   | 崩     | 同上                                |
+| INT SYM low>high filter | WHERE c BETWEEN SYMMETRIC 20 AND 10             | 12,20   | 崩     | 同上                                |
+| VARCHAR subset filter   | WHERE row_id BETWEEN ASYMMETRIC 'r01' AND 'r03' | r01     | 崩     | 同上                                |
+
+**方法论**：vanilla 也崩 = 上游问题（规避输入，测试不做 golden）；vanilla 正常而 native 崩 = 自己的 bug（修复）。这让"甩锅还是背锅"有客观依据。
+
+#### 问题 2：注册名 ≠ function_name（大小写敏感）
+
+- 现象：char_length 虽有 CharLengthFunction 实现，但 RegisterString.cpp 注册名写成 "length" ≠ SQL char_length，native 报 Function not supported（jsonparser.cpp:511）
+- 方案：开发前确认注册名与 SQL 函数名一致（大小写敏感），写入 skill 约束
+
+#### 问题 3：Sink 类型限制导致静默回退
+
+- 现象：Calc 层支持表达式，但 print Sink 输出类型不在 SINK_SUPPORT_DATA_TYPE 白名单（不含 DOUBLE/BOOLEAN/CHAR），isSinkSupportNative=false → useOmniFlag=false 整链回退，无 "not supported" 日志
+- 方案：看 sql-client 日志的 is NOT SUITABLE + outputTypes；诊断脚本用 nohup 后台跑
+
+#### 问题 4：SEARCH/Sarg 形态复杂（BETWEEN/NOT IN 开发）
+
+- 现象：Calcite 把 BETWEEN 优化成 SEARCH(x, Sarg[a..b])，Sarg 有多种形态（isPoints/isComplementedPoints/空 Sarg/多段补集），源码推演不可靠
+- 方案：用 rangeSet.asRanges() 的 hasLowerBound/hasUpperBound/lowerEndpoint/upperEndpoint 判别；补集 Sarg 从 rangeSet.complement().asRanges() 提取；必 e2e 实跑抓 Current rexNode 日志看实际形态
+- 踩坑：NULL 列表的 IN/NOT IN 走 OR(SEARCH, null literal) 路径（非 Sarg），三值自动正确
+
+#### 问题 5：Type B 新 Expr 类导致 ABI 破坏
+
+- 现象：新增 Expr 类（头文件加成员/新 virtual 槽）如 BetweenExpr/SimilarExpr，OmniStream 静态链接 OmniOperator 头文件，ABI 破坏后不重编会导致 ODR/崩溃
+- 方案：Type B（新 Expr 类）必须 omnistream_incr 重编 OmniStream；Type A 向量化（只造函数，.cpp-only）只需 operator_build + deploy 换 .so，不必重编 OmniStream
+
+#### 问题 6：三端类型 ID 系统性错位
+
+- 现象：Java RexTypeToIdMap 与 C++ DataTypeId 基础类型一致，但复合类型（ROW/ARRAY/MAP/MULTISET）及部分 TIMESTAMP 变体数值错位，Java 白名单放行 ≠ C++ 精确签名匹配能执行
+- 方案：复合类型走 native 静默回退优先怀疑此错位；flink-native-expression-analysis skill 做三层一致性扫描
+
+#### 问题 7：LIKE 2-arg escape 引擎级分歧
+
+- 现象：LikeFunction 2-arg 默认 \ escape 是 Spark 语义，Flink 2-arg 无默认 escape，含 \ 模式 native≠vanilla
+- 方案：识别为引擎级设计分歧（非适配 bug），e2e 黄金数据避免 \ 转义模式，只测 %/_/exact/NULL
+
+#### 问题 8：native 字符串按 Unicode 码点计，Flink 按 UTF-16 码元计
+
+- 现象：仅增补平面字符（emoji）分歧，BMP 无分歧
+- 方案：引擎级设计非 bug，e2e 黄金数据避免 emoji
+
+#### 问题 9：OmniAdaptor 决策不校验函数名
+
+- 现象：ValidateCalcOPStrategy 的 case "FUNCTION": 只校验结构不查函数名，决策通过 ≠ native 运行时支持
+- 方案：必跑 native vs vanilla 测试，不能只看是否走 native
+
+#### 问题 10：config.sh 双 echo 陷阱（2026-08-03 踩坑，极高迷惑性）
+
+- 现象：patch config.sh 时忘注释原 vanilla echo（line 47），双 echo 致函数输出两行 → classpath 含空格 → JVM 把 flink-dist.jar /home/.../flink-tnel.jar 当单一含空格无效路径 → flink-tnel.jar 从未加载 → welcome=0 但作业 FINISHED + 输出正确（走了 vanilla 回退）
+- 诊断：cat /proc/$(pgrep -f TaskManagerRunner|head -1)/cmdline|tr '\0' '\n'|grep -A1 classpath，含空格 + .log 无 OmniGraphOverride/flinkPerformance 任何日志 = 双 echo bug
+- 修复：注释 line 47（对照 config.sh.bak），PATCH 含双 jar
+
+#### json_value 深度案例（row JIT 路径标杆）
+
+json_value 是 row JIT 路径的标杆案例：演示特殊参数扩展（2→6 参）、ON EMPTY/ERROR/DEFAULT 行为处理、ExecutionContext 传递、多版本注册。
+
+**Flink SQL 侧 JSON 协议**：function_name="json_value"，returnType=15(VARCHAR)，arguments=[json 字符串, json path]，emptyBehavior/errorBehavior 字段支持 NULL/ERROR/DEFAULT（带 defaultValue，可以是任意 Expr 不限于 LITERAL）。
+
+**Function 注册**（func_registry_string.cpp:295）：2 参数版本（JsonValueRetNull，{VARCHAR,CHAR}→VARCHAR，INPUT_DATA_AND_NULL_AND_RETURN_NULL，setExecutionContext=true）+ 6 参数扩展版（JsonValueWithBehaviors，含 emptyBehavior/defaultOnEmpty/errorBehavior/defaultOnError 4 额外参数）。json_value 属 JSON 函数但注册在 StringFunctionRegistry（历史原因）。
+
+**C++ 核心实现**（stringfunctions.cpp）：JsonValueRetNull(int64_t contextPtr, jsonStr 三元组, pathStr 四元组, outIsNull, outLen)。关键：NULL 输入处理（jsonStrIsNull||pathStrIsNull → outIsNull=true）；ExecutionContext 管理线程级 JSON 缓存避免重复解析；ParseJsonPath 支持 .key/[index]/['key']/["key"] 四种语法；NavigateJsonPath 导航；标量提取（bool→"true"/"false"，number→字符串格式，string→原值转义处理，对象/数组→NULL）；异常安全（try-catch，异常时按 errorBehavior 决定）。
+
+> 注：BuildJsonValueArguments 的 2→6 参扩展（ON EMPTY/ERROR/DEFAULT 行为字段）在当前代码未实现——json_value 在 ParseJSONFunc 走通用参数解析无特殊扩展。C++ 实现 JsonValueRetNull 与注册存在，但 2→6 参扩展机制为设计示意非当前实现。
+
+#### 全链路排错指南
+
+**表达式未进入 Native 路径**（SQL 执行正确但无 [OmniStream] 输出）：grep OmniGraphOverride flink-*.log；常见原因 specialOperatorMap 未添加映射 / 参数类型不在 is_supported_type / ValidateCalcOPStrategy 校验失败。
+
+**JSONParser 解析失败**（Function not supported: <name>）：确认 function_name 拼写与 C++ 注册名完全一致（大小写敏感）；确认 paramTypes/retType 与 FunctionSignature 匹配；检查 returnType 整数 ID。反例 char_length：RegisterString.cpp:42 注册名 "length" ≠ SQL char_length。
+
+**CodeGen/JIT 编译失败**（JIT 报错或段错误）：检查 C++ 函数签名——VARCHAR 参数 (char*, int32_t len, bool)；CHAR 参数 (char*, int32_t width, int32_t len, bool)（四元组）；字符串返回 char*+末尾 int32_t* outLen；DECIMAL128 参数 (int64_t high64, uint64_t low64)；setExecutionContext=true 时首参 int64_t contextPtr。
+
+**welcome=0 且无 "not supported" 日志（静默回退）**：多半是 Sink 类型限制——看 sql-client 日志的 is NOT SUITABLE + outputTypes。Sink 输出类型须在 SINK_SUPPORT_DATA_TYPE 内（不含 DOUBLE/BOOLEAN/CHAR），否则 isSinkSupportNative=false → useOmniFlag=false 整链回退。Calc 支持 ≠ 端到端可测。诊断脚本用 nohup 后台跑避免 stop-cluster/pkill 的 ssh 抖动。
+
+**welcome=0 诊断决策树**（逐项排雷）：① .log/.out 有 OmniGraphOverride/flinkPerformance 日志？无→覆盖类未加载→查 config.sh 双 echo 或 flink-tnel.jar 未进 classpath；② .log 有 TNELLibrary - Loading？无→libtnel.so 未加载→查 LD_LIBRARY_PATH 含 DEPLOY_DIR；③ welcome 0→0 但有 OmniGraphOverride 日志→决策 NOT SUITABLE→查部署 jar 是否含白名单/决策类 stale，或作业图无 Calc（纯投影被 planner 消除）→加 WHERE 强制 Calc 重测；④ 作业图有 Calc + 覆盖类加载 + 仍 welcome=0→查 validateVertexForOmniTask 日志看哪个算子 false。
+
+**归因原则**：vanilla 是正确性基线。native 失败而 vanilla 正确 → 是 Omni 模块 bug 不是 Flink；绝不能只凭源码分析就把 native 失败归给 Flink。分清阶段：planner 期失败（translateToPlan/SearchOperatorGen/RexSimplify）在 native 与 vanilla 共享同一 planner 时两边都崩；若 vanilla 不崩只 native 崩 → 是 OmniAdaptor planner 覆盖或 OmniStream 运行期问题。
+
+**关键踩坑速查表**：
+
+| 踩坑 | 表现 | 根因/修复 |
+|---|---|---|
+| 注册名 ≠ function_name | Function not supported | 注册名与 SQL 函数名大小写一致（反例 char_length） |
+| VARCHAR 漏 width | Function not supported | returnType 整数 ID + width 字段 |
+| INPUT_DATA null 短路 | null 输入函数不执行 | 需感知 null 改 INPUT_DATA_AND_NULL* |
+| pc=0x0 SIGSEGV | 空函数指针解引用 | Type B Expr 漏注册 CHAR 组合（VectorFunction::Find 精确匹配无转换） |
+| 字符串 emoji 假 diff | native≠vanilla | native 按 Unicode 码点计、Flink 按 UTF-16 码元计，仅增补平面分歧；e2e 黄金数据避免 emoji |
+| LIKE \ escape 假 diff | native≠vanilla | OmniOperator 2-arg 默认 \ escape（Spark），Flink 无默认 escape；e2e 勿含 \ 转义模式 |
+| WRITE_TO_FILE 未在 start 前 export | /tmp/flink_output.txt 为空 | 由 TM 进程启动时读取，先启动再 export 不生效 |
+| cmake GLOB 掉文件 | 改了 .cpp 但 .o mtime 没变 | file(GLOB_RECURSE) 无 CONFIGURE_DEPENDS，手动 cmake .. 重 GLOB |
+| OmniAdaptor import Guava | package com.google.common.collect does not exist | Flink shaded，用 commons-lang3 或 org.apache.flink.shaded.guava30.* |
+| 字符串函数只注册 VARCHAR | 带 CHAR 字面量 SIGSEGV | VectorFunction::Find 精确匹配，须注册 VARCHAR+CHAR 全组合 |
+| default: 无 throw | 静默吞异常 | 改回 throw std::runtime_error(...) |
+| operator_incr 装位 ≠ deploy 读位 | e2e 加载不到新代码 | cmake --install 装到 /opt/lib，deploy 从 $OMNI_HOME/lib 拷；中间须跑 install_omni_operator_vec.sh |
+
+### 2.7 开发工具链建设
+
+**开发流程五步法**（强制）：
+
+1. 先设计（方案/签名/类型/测试用例/调研函数字典）
+2. 审计计划（review 通过后才执行）
+3. 开分支（fork 模型，每需求新分支，从 upstream/2026_930_poc 切出）
+4. 编码 + 自测（UT + 端到端 native vs vanilla 黄金对比）
+5. 提 PR/MR（不自动提，人工确认）
+
+**6 个 Skill 工具链**（安装在 .claude/skills/，触发词出现时先 invoke skill 再动手）：
+
+| Skill                             | 用途                                                                  |
+| --------------------------------- | --------------------------------------------------------------------- |
+| omnioperator-expression-dev       | OmniOperator 向量化函数实现（含模板/设计文档模板/单测模板）           |
+| omniadaptor-vectorized-expression | OmniAdaptor 侧适配（先调研后适配：函数字典→RexNodeUtil→字典）       |
+| omnistream-expression-dev-test    | 全周期编排（实现→适配→编译→部署→测试→报告，覆盖 Type A/B/C/D）   |
+| flink-native-expression-analysis  | 三层支持现状扫描（native注册/Java决策/离线字典）+ 缺口报告            |
+| omnistream-build-deploy           | 三仓库增量编译 + 部署 + native 使能测试                               |
+| omnistream-expression-test        | native vs vanilla 黄金对比（本地 csv+sql 用例 + 归一化对比 + 富报告） |
+
+**审计 skill 升级**：目标改为"每次开发完成后自动触发审计"，沉淀项目特有注意点，保证 skill 通用可复用。把人工检查变成流程的一部分。
+
+**测试方法论**：
+
+- UT（单元测试）：C++ 侧 VectorFunction::Apply 直驱测函数语义（三值逻辑/边界/类型分派）；Java 侧 RexNodeUtil.buildJsonMap 直驱测翻译（非平凡翻译时写）
+- e2e（端到端）：固定 CSV 静态输入 + SQL 表达式，OmniStream native 与原生 Flink 1.16.3 逐行对比
+- 通过判据：① TM 日志出现 welcome to native（OmniTask.cpp:315）；② native 输出与 vanilla 归一化后 IDENTICAL
+
+#### 2.7.1 表达式开发文件清单与完整示例
+
+> 开发一个表达式代码改动散落在 2~4 个文件、2~3 个仓库，新手困惑于该改 Java 还是 C++、该用向量化还是 row JIT、改完一个文件还有哪些配套必须同步改。以下为整理的"文件地图"。
+
+**三仓库在表达式开发中的角色**：
+
+| 仓库 | 语言 | 角色 |
+|---|---|---|
+| OmniAdaptor | Java | 表达式的入口：把 RexCall 翻译成 JSON 表达式协议，决定表达式长什么样、能否进 native |
+| OmniStream | C++ | 基本不动：向量化计算全权委托 OmniOperator，只当搬运工 |
+| OmniOperator | C++ | 表达式的实现：JSON→Expr→机器码→执行 |
+
+**两类文件区分**：每表达式都要写的"交付物文件"（函数实现 .h/.cpp、注册 Register*.cpp、单测、RexNodeUtil.java）；框架文件/运行时骨架（expressions.h、jsonparser.cpp、ExprEval.cpp、codegen），不是每个表达式都动，只在特殊语法/新类型时才扩展。大多数标量函数（Type A）只动交付物文件，框架文件已经就绪。
+
+**按类型速查改哪些文件**：
+
+```
+Type D（最简，仅改名/复用已有 C++ 函数）:
+  → RexNodeUtil.java（1 个文件）
+
+Type A 向量化（最常见标量函数）:
+  → RexNodeUtil.java + flink_function_dictionary.json
+  → OmniOperator: <Name>.h[+.cpp] + Register<Category>.cpp[+Register.cpp] + <Name>Test.cpp + 设计文档
+
+Type A row JIT（逐行复杂/需 ExecutionContext）:
+  → RexNodeUtil.java + 字典
+  → OmniOperator: <domain>functions.{h,cpp} + func_registry_<domain>.cpp + test
+
+Type B（特殊语法/新 exprType）:
+  → RexNodeUtil.java + ValidateCalcOPStrategy.java + 字典
+  → OmniOperator: jsonparser.{h,cpp} [+ expressions.h 新 Expr 类 + codegen Visit]
+  → 若新 Expr 类（ABI 破坏）: 需 omnistream_incr 重编 OmniStream
+
+Type C（聚合）:
+  → StreamExecGroupAggregate.java + 字典
+  → OmniOperator: aggregation/ Aggregator 子类 + 工厂
+  → 需 omnistream_incr 重编 OmniStream
+```
+
+**OmniAdaptor 侧文件清单**：
+
+| 文件 | 为什么写 | 适用 |
+|---|---|---|
+| RexNodeUtil.java | 入口：把 Calcite RexCall 翻译成 JSON。改 3 处：specialOperatorMap（函数名→枚举映射）+ SpecialExprType 枚举（加新值）+ buildJsonMap switch case（生成 exprType/function_name/arguments） | A/B/C/D 通用必须 |
+| ValidateCalcOPStrategy.java | 白名单校验：检查生成的 JSON 结构合法（字段存在性 + 递归校验子表达式），挡掉非法表达式 | 仅新增 exprType 时（B） |
+| flink_function_dictionary.json | native 开关 + 类型白名单：标记 is_support_func:true + is_supported_type。不改则表达式根本不进 native | A/B/C/D 可选但实际都要 |
+| flink_function_return_type.json | 返回类型元数据，供 planner 推断/校验 | 通用可选 |
+| StreamExecGroupAggregate.java | 聚合函数名映射（Flink STDDEV_POP → native stddev_pop），生成算子级 aggInfoList | 仅 Type C |
+| RexNodeUtilXxxTest.java | Java UT：直驱 buildJsonMap 验证 RexCall→JSON 翻译，本地 mvn test 秒级反馈（无需鲲鹏） | 仅非平凡翻译时 |
+
+**RexNodeUtil.java 的 3 处改动详解（以 ABS 为模板）**：
+
+```java
+// (a) specialOperatorMap 静态注册—— key 必须与 Calcite 算子名完全一致（通常大写）
+specialOperatorMap.put("ABS", SpecialExprType.ABS);
+// (b) SpecialExprType 枚举—— 新增枚举值
+public enum SpecialExprType { ..., ABS, }
+// (c) buildJsonMap 的 switch 分支—— function_name 必须与向量化注册名严格一致（通常小写）
+case ABS:
+    jsonMap.put("exprType", "FUNCTION");
+    setDataType(rexCall, jsonMap, "returnType");
+    jsonMap.put("function_name", "abs");
+    List<Map<String, Object>> absArgList = new ArrayList<>();
+    absArgList.add(buildJsonMap(operands.get(0)));
+    jsonMap.put("arguments", absArgList);
+    break;
+```
+
+**OmniOperator 侧文件清单（Type A 向量化路径）**：
+
+| 文件 | 为什么写 | 是否必须 |
+|---|---|---|
+| vectorization/functions/<Name>.h | 函数类声明：struct + call()/callNullable() 模板特化，定义函数语义（返回 Status/bool/void 三约定之一） | 必须 |
+| vectorization/functions/<Name>.cpp | 复杂逻辑实现（日期/数组/字符串 helper）。简单纯算术可只写 .h | 复杂逻辑时 |
+| vectorization/registration/Register<Category>.cpp | 注册函数：RegisterFunction<Func,Ret,Args>(name,{入参类型},返回类型) 挂进 simpleFunctionFactoryMap_。注册名 = function_name（大小写敏感，dispatch 唯一键） | 必须 |
+| vectorization/registration/Register.cpp | 把 Register<Category>Functions(prefix) 挂进 RegisterAllFunctions | 该 category 未注册时 |
+| test/vectorization/<Name>Test.cpp | 单测（强制交付物）：VectorFunction::Apply 直驱测函数语义（三值逻辑/边界/类型分派），隔离 ExprEval/决策链 | 必须（非可选） |
+| docs/expression-design/<func>_design.md | 设计文档：编码前先写（语义/类型/边界/注册方案/测试计划），过 design review 才实现 | 推荐 |
+
+**call() 返回值三约定**（向量化路径核心，决定 NULL 处理）：
+
+| 返回类型 | 含义 | 适用 |
+|---|---|---|
+| Status | Status::OK() 成功 / Status::UserError(...) 出错；null 由向量框架处理 | 算术/math/bitwise |
+| bool | true=有效结果，false=输出 NULL（bool 成为输出向量的 null 标志） | 字符串/比较 |
+| void | 总是非 NULL 结果（notNull=true） | 必然非空 |
+
+**row JIT 路径文件**：codegen/functions/<domain>functions.{h,cpp}（C 函数声明+实现，extern "C" DLLEXPORT，行级三元组参数规范 (value,len,isNull)，ArenaAllocatorMalloc 分配禁用 new/malloc）+ codegen/func_registry_<domain>.cpp（Function 构造注册：函数指针 + name + 参数类型 + 返回类型 + NullableResultType NULL 策略 + 是否需 ExecutionContext）。
+
+**C 函数参数规范（row JIT 路径）**：
+
+- 标量入参三元组：(type value, int32_t len, bool isNull)
+- VARCHAR 字符串入参：(const char*, int32_t len, bool isNull)
+- CHAR 字符串入参四元组：(const char*, int32_t width, int32_t len, bool isNull)（width 排第 2）
+- 字符串返回值：返回 const char*，末尾出参 (bool *outIsNull, int32_t *outLen)
+- ExecutionContext（可选首参）：int64_t contextPtr，仅 setExecutionContext=true 时注入
+- 内存：字符串结果须用 ArenaAllocatorMalloc() 分配（框架批次结束自动回收，禁用 new/malloc）
+
+**NullableResultType 5 档**（NULL 处理策略）：
+
+| 枚举 | 语义 | 适用 |
+|---|---|---|
+| INPUT_DATA | 入参 NULL 时函数不调用，直接返回 NULL（短路） | 多数确定性标量函数 |
+| INPUT_DATA_AND_NULL | 传入 null 标志，函数自行处理 NULL | 需感知 NULL 的函数 |
+| INPUT_DATA_AND_OVERFLOW_NULL | 入参 + 溢出返回 NULL | Decimal 运算、CAST |
+| INPUT_DATA_AND_NULL_AND_RETURN_NULL | 入参可 NULL 且返回可 NULL | json_value、regex_extract |
+| DEFAULT | 默认 | — |
+
+**数据类型映射**：
+
+| Flink SQL | Omni DataTypeId | 常量 |
+|---|:---:|---|
+| INT/INTEGER | 1 | OMNI_INT |
+| BIGINT | 2 | OMNI_LONG |
+| DOUBLE | 3 | OMNI_DOUBLE |
+| BOOLEAN | 4 | OMNI_BOOLEAN |
+| DECIMAL(≤18/>18) | 6/7 | OMNI_DECIMAL64/128 |
+| VARCHAR/STRING | 15 | OMNI_VARCHAR |
+| CHAR | 16 | OMNI_CHAR |
+
+**两个必踩的坑**（贯穿所有类型）：
+
+1. 注册名 ≠ function_name（大小写敏感）→ 运行期 Function not supported。Register*.cpp / func_registry_*.cpp 里的注册名必须与 RexNodeUtil 生成的 function_name 完全一致（大小写敏感）。反例 char_length：RegisterString.cpp 注册名写成 "length" ≠ SQL char_length，导致虽有 CharLengthFunction 实现，native 仍 not supported（jsonparser.cpp:511）。
+2. 改 RexNodeUtil 前不调研 → 类型不支持 / 语义不一致。动 RexNodeUtil.java 前必须先核对：Flink 侧语义/类型（flink_function_dictionary.json 允许哪些入参类型、NULL 行为、边界行为）；OmniOperator 向量化注册类型（Register*.cpp 注册了哪些入参 OMNI 类型重载、call() 语义是否与 Flink 一致）；入参类型匹配（RexNodeUtil 将传入的类型与向量化已注册类型逐一比对）。跳过调研会导致类型不支持（未注册）、语义不一致（下标基准/NULL/边界/时区差异）。
+
+**完整示例：走 Type A 向量化实现 ABS**：
+
+步骤 1 调研（动代码前）：查字典确认 ABS 支持 BIGINT/INTEGER/DOUBLE；查 Register*.cpp 确认 abs 注册了对应类型重载；确认 call() 语义（返回绝对值，null 由框架处理）与 Flink 一致。
+
+步骤 2 OmniAdaptor 适配（2 文件 4 处）：flink_function_dictionary.json 加 `{"func_name":"ABS","is_support_func":true,"is_supported_type":["BIGINT","INTEGER","DOUBLE"]}`；RexNodeUtil.java 3 处（specialOperatorMap + SpecialExprType.ABS + buildJsonMap case 生成 function_name:"abs"）。
+
+步骤 3 OmniOperator 实现（向量化路径，3 文件）：Abs.h（函数类，call() 返回 Status，null 由框架处理）；RegisterMath.cpp（RegisterFunction<AbsFunction,...>(prefix+"abs",{OMNI_INT/OMNI_LONG/OMNI_DOUBLE},...) 三个类型重载）；AbsTest.cpp（VectorFunction::Apply 直驱单测，正常值/边界/类型分派）。
+
+步骤 4 构建 + 对比（委派 skill）：omnistream-build-deploy（adaptor_build + operator_build + deploy，仅 Type A 向量化不用 omnistream_incr）；omnistream-expression-test（native vs vanilla 黄金对比，通过判据 = 逐行一致且 welcome to native 计数 > 0）。
+
+**关键文件路径速查**：
+
+| 角色 | 路径 |
+|---|---|
+| JSON 协议生成（OmniAdaptor 主改动） | omniop-flink-extension/omni-table-planner/.../plan/nodes/exec/util/RexNodeUtil.java |
+| 白名单校验 | omniop-flink-extension/.../streaming/api/graph/validate/strategy/ValidateCalcOPStrategy.java |
+| 聚合映射（Type C） | omniop-flink-extension/.../plan/nodes/exec/stream/StreamExecGroupAggregate.java |
+| 函数字典 | omnihelper/resources/flink_function_dictionary.json |
+| 向量化函数实现 | OmniOperator/core/src/vectorization/functions/<Name>.{h,cpp} |
+| 向量化函数注册 | OmniOperator/core/src/vectorization/registration/Register<Category>.cpp |
+| 向量化单测 | OmniOperator/core/test/vectorization/<Name>Test.cpp |
+| row JIT 函数 | OmniOperator/core/src/codegen/functions/<domain>functions.{h,cpp} |
+| JSON 解析（Type B） | OmniOperator/core/src/expression/jsonparser/jsonparser.{h,cpp} |
+| Expr AST 类（Type B） | OmniOperator/core/src/expression/expressions.{h,cpp} |
+| LLVM codegen（Type B） | OmniOperator/core/src/codegen/{expression_codegen,batch_expression_codegen}.cpp |
+
+### 2.8 知识库产出
+
+在 `D:\Myknows\项目\Omni大数据` 撰写完整知识体系，共约 106 篇 Markdown 文档（教程 2.0，2026-07-23 重构完成，基于三仓库源码分支 2026_930_poc）。两层读法：38 篇技术文档（按五篇组织，讲每个子系统的设计动机/原理/源码关键点）+ 19 篇"一事一文"设计思想短文。
+
+#### 2.8.1 教程 5 大块
+
+**01-总览与基础（5 篇：打地基）**：
+
+- 1-1 背景与动机：算力增长滞后数据增长；Flink JVM 三瓶颈（GC 停顿/JIT 预热/对象序列化）共同根源"JVM 托管执行+行式对象模型"；四点核心价值（消除 JVM 开销/向量化计算/减少跨语言开销/状态访问优化）；六项设计目标；两件交付物（flink-tnel.jar + libtnel.so）；零侵入落点（config.sh + flink-conf.yaml）；核心入口 OmniStreamTask
+- 1-2 Omni 生态全景：三组件层次（BoostKit 大数据 → OmniRuntime 2.2.0 → OmniOperator + OmniAdaptor + OmniStream）；关键纠偏（flink-tnel.jar 属 OmniAdaptor 非 OmniStream；OmniOperator 三库经 --whole-archive 静态链接进 libtnel.so 非运行期 dlopen）
+- 1-3 双层架构总览：Java 适配层四职责（拦执行计划/判断 Native 化/JNI 初始化/不支持回退）；C++ 核心层七大模块（Streaming Runtime/SQL 算子引擎/DataStream 算子引擎/数据层/连接器/状态管理/运行时基础设施）规模；JNI 桥接层 25 头文件 + 5 Bridge 实现类双向通信
+- 1-4 4+1 视图与术语地图：Kruchten 4+1 视图（场景/逻辑/进程/开发/物理）；九个核心术语（TNEL/VectorBatch/StreamRecord/OperatorChain/Mailbox/Falcon/OmniTaskBridge/Nexmark/rdkafka）
+- 1-5 关键设计决策与能力边界：7 个 ADR 分三层（架构层 ADR-1 双层/ADR-3 Mailbox 单线程；性能层 ADR-2 列式向量化/ADR-5 Falcon 缓存/ADR-6 rdkafka；兼容层 ADR-4 算子级回退/ADR-7 UDF 翻译）；能力边界表（V1.2.0）；演进路线
+
+**02-端到端主线（7 篇：串全貌）**：
+
+- 2-1 导读：一条 SQL 作业完整旅程 5 阶段；三层插手时机；跨 JNI 边界关键载荷（3 段 JSON POD：JobInfo/TaskInfo/TDD）
+- 2-2 SQL 解析与执行计划：不改 Calcite 优化规则在 ExecNode.translateToPlanInternal() 后置扩展点叠加；四层链路（SQL→RelNode→ExecNode DAG→Transformation→StreamGraph）；RexNodeUtil 核心；Calc 算子 native JSON 结构
+- 2-3 JobGraph 生成与算子回退决策：classpath 覆盖注入；决策三层结构（OmniGraphOverride 决策中心/ValidateOperatorStrategyFactory 策略工厂/Validate*OPStrategy 校验策略）；三枚枚举；task 级回退条件；混合执行格式转换开销
+- 2-4 运行时调度与 NativeTask 创建：两阶段 JNI（submitTaskNative 三段 JSON→POD→创建 OmniTask 容器返回指针；createNativeStreamTask 传回地址 new StreamTask）；invokable class 替换映射；TDD 三段 JSON→POD；进程模型（C++ 跑在 TM JVM 地址空间非 fork）；命名陷阱（两个同名 StreamTask 类）
+- 2-5 Native 算子执行 Mailbox 与算子链：Mailbox 模型（多写单读优先级队列状态机 OPEN→QUIESCED→CLOSED）；事件循环；OperatorChainV2 构建（restoreInternal 阶段非 invoke）；processElement 两条路径（SQL 列式批量+JIT / DataStream 行式+UDF）；链内 ChainingOutput 零拷贝；SQL Calc JIT 调用链
+- 2-6 数据 IO/Shuffle/State/Checkpoint：数据 IO 闭环；网络 Shuffle 三条路径（同 TM 链内零拷贝/同 TM 跨 Task ByteBuffer/跨 TM VecBatchSerializer+Netty）；Falcon 缓存三条读路径；Checkpoint 七步时序（1-5/7 Mailbox 主线程串行，6 异步物化）
+- 2-7 DataStream 端到端差异与时序总图：SQL 与 DataStream 骨架一致差异在三处（算子工厂分发/数据模型/算子内部计算路径）；UDF 加载（dlopen+dlsym NewInstance，.so 常驻）；行式 Calc row codegen 已禁用；DataStream 加速来源仅三层（消除 JVM+rdkafka+OmniStateStore）
+
+**03-核心子系统（12 篇：深挖）**：
+
+- 3-2 Java 适配层与 JNI 桥接：Java 适配层三项职责（执行计划解析/算子回退管理/TDD 序列化与 JNI 移交）；JNI 双向（下行 25 头文件 native 方法，上行 5 Bridge 类回调）；核心 Bridge OmniTaskBridgeImpl2 方法签名；init.cpp 仅 2 个 JNI 函数
+- 3-3 算子工厂与算子体系：算子继承层次（StreamOperator→AbstractStreamOperator<K>→具体算子）；工厂分发（StreamOperatorFactory::createOperatorAndCollector 按 OperatorPOD.id 路由 25 个 CreateXxxOp）；SQL 算子（operatorType=1 消费 VectorBatch：StreamCalcBatch/KeyedProcessOperator/StreamingJoinOperator/WindowAgg 等）；DataStream 算子（operatorType=2 消费 StreamRecord：StreamMap/FlatMap/Filter/Reduce 等）；KeyedProcessOp 二级分发；StreamOperatorWrapper RAII 级联释放；设计模式落地 7 种
+- 3-4 SQL 算子引擎上 Calc 与 GroupAgg：Calc 表达式求值五阶段链路；表达式白名单；四类开发形态 Type A/B/C/D；GroupAggFunction 三入口（processElement/processBatch/processBatchColumnar）；聚合基类四方法（Init/Update/Merge/GetResult）；三种聚合模式（Local/Global/Incremental）
+- 3-5 SQL 算子引擎下 Join/Window/Rank/Dedup：四类有状态+时序算子全基于 VectorBatch；Join 三形态（双流 Join/LookupJoin/WindowJoin）；Window 两实现（WindowOperator+AggregateWindowOperator / SlicingWindowOperator+AbstractWindowAggProcessor）；Rank/Dedup 共享 KeyedProcess 工厂入口（FastTop1/AppendOnlyTopN/RowTimeDeduplicate）
+- 3-6 DataStream 算子引擎：算子类层次三层（StreamOperator→AbstractStreamOperator→AbstractUdfStreamOperator 持 userFunction）；UDF 调用机制（构造期 dlopen+dlsym，每记录调一次）；KeyedProcessOperator/KeyedCoProcessOperator；StreamFilter 特例（同时含行式 processElement 与列式 processBatch）
+- 3-7 数据模型 VectorBatch 与 StreamRecord：VectorBatch（列式继承 omniruntime::vec::VectorBatch 附加 timestamps/rowKinds；列式连续内存对 SIMD 友好；extractRowData 列→行；getXXH128s 行指纹）；StreamRecord（行式信封继承 StreamElement）；RowData 抽象基类三实现（BinaryRowData/JoinedRowData/GenericRowData）；ADR-2 代价（行列转换开销+内存增长快）
+- 3-8 状态管理与 OmniStateStore：两种状态后端（Heap/RocksDB）+ 第三种 BSS（实验性 WITH_OMNISTATESTORE）；ValueStateCache<K,N,V> 8 方法纯虚接口（实现 ValueStateLRUCache 底层 unordered_map 非 LinkedHashMap）；isDirty 延迟写入语义；三类 Filter/memTable 优化（动态 Filter/前缀 Filter/memTable HashLinkList，均默认 false）；Mailbox 单线程→状态缓存免锁
+- 3-9 Checkpoint 机制全流程：Chandy-Lamport 变体；7 步时序及线程归属；Barrier 对齐（Aligned/Unaligned 状态机）；能力边界（SQL 暂不支持/DataStream 仅 RocksDB/定时器不入 Checkpoint）
+- 3-10 网络 IO 与 Shuffle：C++ 侧重写网络栈（发送侧/接收侧/Buffer 池两族/Netty 传输层）；分叉点在子分区（同 TM 本地内存零序列化/跨 TM Netty TCP+NetworkBuffer）；Credit-based 流控；Blocking 模式 Java 侧承担；网络通信矩阵三条独立通道
+- 3-11 Kafka 连接器：基于 rdkafka Native 消除 Java Kafka Client 跨语言开销；专用优化补丁 omni_kafka_opt.patch（produce 批量重载/consumeBatch/批量引用计数/锁粒度 row→batch）；KafkaSource 读取链；KafkaWriter 四件套（双生产者分工/后台工作线程/定时刷盘回调/分割阈值 10000）；投递保证三档（NONE/AT_LEAST_ONCE/EXACTLY_ONCE）；BindCoreManager 三策略
+- 3-12 运行时基础设施：四大支柱——内存管理（jemalloc 5.3.0 LD_PRELOAD 全局替换+MemorySegment RAII+两族 Buffer 池）/ Metrics 监控（SHMMetric mmap 共享内存零拷贝指标传输）/ 配置管理（POD 结构体族 nlohmann::json 一次性解析）/ 构建依赖（libtnel.so 单一产物，GCC+CMake+毕昇 JDK+LLVM 15+Maven，核心依赖版本）
+
+**04-专题扩展（11 篇：可选）**：
+
+- 4-2 OmniOperator 底层向量化库：三模块（vector_batch/vector_helper/codegen）三层（列式批数据层/表达式与 JIT 层/SIMD 指令层）；列批容器内存结构；SIMD 向量化三落点；LLVM JIT 编译流程；OmniStream 复用边界（--whole-archive 静态链接非 dlopen）；5 个 .so 产物
+- 4-3 列式存储文件格式详解：ORC/DWRF/Parquet 物理结构对比；ORC RowIndex 带 SUM 统计但无 Page 级 OffsetIndex vs Parquet 有 Page 级 ColumnIndex/OffsetIndex；DWRF FlatMap；Parquet rep/def levels；解码器选择；磁盘格式 vs 内存 VectorBatch 靠 DWIO ColumnReader 解码衔接
+- 4-4 codegen 与 vectorization 对比：两套表达式执行后端共享 Expr AST/FunctionSignature/列存结构；Codegen 两层职责（原子函数 g++ 编进.so + 表达式胶水 LLVM JIT 运行时生成）；Vectorization（ExprEval 遍历 AST→VectorFunction Apply 列批次）；路径选择公式；SVE 加速四路径
+- 4-5 bolt 架构设计：源自 Velox C++ 列存加速库七层架构；分级 MemoryPool+仲裁+算子级 Spill 三级联动防 OOM；与 OmniOperator 无代码血缘
+- 4-6 OmniAdaptor 架构设计：透明胶水层不改用户作业不改引擎内核；Spark 走 Catalyst 规则注入/Flink 走 StreamTask 基类替换；三层防线回退；跨语言零拷贝
+- 4-7 Spill 机制与 SortOperator：三阶段（累积 AddInput 仅存指针/落盘 SpillToDisk 先 Sort 再写盘/归并 GetOutput LoserTree K 路归并）；Sort-Merge 策略；败者树；双层配额管控；RAII 文件管理；零拷贝写盘
+- 4-8 向量化 HashTable 优化：垂直哈希表+Handle 压缩（单条体积减半 SVE 单次处理翻倍）；类型转换消除；仅 32 位定长 Key
+- 4-9 Hash-Aggregation 与 Window 两阶段：两类聚合哈希表（定长 Key 表/变长 Key 表）；Window 两阶段（Local Slice+Global Window）
+- 4-10 Typer-HashTable 融合：SVE 表擅长定长低基数/Typer 表擅长变长高基数；融合覆盖全场景；TPC-DS 基准多数查询提升>5%
+- 4-11 表达式执行内部与使能流程：useCodegen 切换公式；两套 CodeGen 模式（行式/批式）；函数解析四条子路径；SQL 算子执行路径分配；表达式使能 native 四步
+
+**05-工程实践（8 篇：上手）**：
+
+- 5-2 编译与构建：统一构建脚本 build_pipeline.sh 四种模式+三个正交开关；五大产物；三仓库编译顺序（OmniOperator→OmniAdaptor→OmniStream）
+- 5-3 部署与配置：Docker 三容器拓扑（flink_jm + flink_tm1 + flink_tm2 同跑鲲鹏 920）；两处 Flink 配置缺一不可（config.sh 注入 PATCH JAR + flink-conf.yaml java.library.path）；四类环境变量；使能成功标志 welcome to native
+- 5-4 测试体系：四层测试金字塔（单元 googletest/功能 JSON 配置驱动/端到端 job.json/基准 Nexmark Q0-Q22）；对拍验证；覆盖率 lcov
+- 5-5 开发指南：新增 Native 算子流程（加算子名常量+加 CreateXxxOp+加路由分支，开闭原则）；表达式开发四类
+- 5-6 UDF 翻译工具：udf_translate.sh；依赖 cpp/translate/ 30+ Java 基础类型和 20+ 第三方库 C++ 等价实现；翻译依赖（AI4C/KACC_JSON/KSL）；白名单
+- 5-7 性能调优与问题排查：Nexmark 基准测试；welcome to native 诊断；回退诊断；Metrics 监控
+- 5-8 操作命令速查：编译/部署/测试纯命令清单 + mermaid 流程图
+
+#### 2.8.2 术语词典（5 大类 306 条）
+
+| 大类 | 子目录 | 条目数 | 代表术语 |
+|---|---|---|---|
+| Flink 与流处理 | 作业图与调度/执行模型与算子/SQL与算子操作/状态与容错/时间窗口与API | 81 | StreamGraph/JobGraph/Mailbox/Checkpoint/Barrier/Watermark/Window/UDF |
+| OmniStream 专有 | 总体架构与生态/适配与回退/执行与数据模型/状态与运行时 | 51 | OmniStream/TNEL/libtnel.so/VectorBatch/Falcon/SHMMetric/BSS |
+| C++与 JNI | JNI与跨语言/语言特性与内存/构建与测试工具 | 55 | JNI/POD/dlopen/RAII/intrusive_ptr/CMake/GoogleTest |
+| 性能与向量化 | 向量化与SIMD/JIT与codegen/内存IO与编译优化/参照库bolt与Velox | 63 | SIMD/SVE/AArch64/LLVM IR/ExpressionEvaluator/jemalloc/Spill |
+| 存储与网络IO | 列式文件格式/KV状态与Spill/Kafka与消息队列/网络与Shuffle | 56 | ORC/Parquet/RocksDB/Kafka/Netty/Credit-based流控 |
+
+#### 2.8.3 设计思想（19 篇短文，七大类）
+
+**设计模式-创建型（2 篇）**：工厂方法（StreamOperatorFactory 统一造对象）/ 模板方法（AbstractStreamOperator 定骨架子类填 processElement）
+
+**设计模式-行为型（4 篇）**：策略模式（KeyedProcessOperator+四种 ProcessFunction；聚合三模式；Aligned/Unaligned；codegen vs vectorization）/ 责任链（OperatorChainV2+StreamOperatorWrapper+ChainingOutput）/ 生产者-消费者（Mailbox 多写单读；Credit-based 流控；KafkaWriter 双 Producer+worker_thread）/ 命令模式（Mail 把跨线程操作封装成对象排进 Mailbox 队列）
+
+**设计模式-结构型（2 篇）**：适配器（Java 适配层给 Flink 执行计划接口加转接头；SimpleFunction 单行适配器）/ 桥接（执行引擎语言 C++ vs Java 和生态复用 Flink 两个独立维度用 JNI 桥接拆开）
+
+**系统设计原则-架构（2 篇）**：分层架构（Java 适配层翻译+守门，C++ 核心层计算；向量化库三层；横切关注点收敛运行时基础设施层）/ 插件化（只改 config.sh 和 flink-conf.yaml；classpath 覆盖同包同名类顶替原生）
+
+**系统设计原则-可靠性（2 篇）**：回退降级（算子级回退 ADR-4；codegen 不支持回退 vectorization；Spill 落盘）/ 异步物化（AsyncCheckpointRunnable 异步物化线程池；KafkaWriter worker_thread 异步发送；Netty IO 线程独立）
+
+**系统设计原则-性能（3 篇）**：零拷贝（ChainingOutput 传裸指针；SHMMetric 共享内存；MemorySegment 复用；DirectByteBuffer 直通）/ 向量化批处理（VectorBatch 列式连续内存+SVE；8 字节对齐+独立空值位图；VECTORIZE_LOOP 宏）/ 读写缓存（Falcon 缓存热状态留内存+isDirty 延迟写入+Checkpoint flush 批量刷盘）
+
+**设计原则-评判标尺（3 篇）**：开闭原则（新增算子只加代码不改老算子；ExecNode 后置扩展点不改 Calcite 规则）/ 单一职责（StreamOperator 只管计算；C++ 核心层专注计算凡需 Flink 基础设施交回 Java）/ 依赖倒置（OperatorChainV2 拿 StreamOperator* 指向接口不关心具体实现；OmniOperator 公共底座多引擎复用）
+
+**C++设计手法（1 篇）**：RAII（StreamOperatorWrapper 析构级联 delete 整条算子链；MemorySegment 绑定对象生命周期；OmniOperator 对齐缓冲区构造 ReportMemory/析构 ReclaimMemory）
+
+每篇短文结构：设计模式/原则定义 → 生活比喻 → OmniStream 工程实践落地 → 思想间关联。
+
+#### 2.8.4 表达式运行时文档
+
+2 个表达式（IFNULL/LEFT-RIGHT）的完整四层架构分析文档（每个 10 篇），含测试用例、端到端流程、分层详解、单行数据旅程、关键文件索引、已知偏差。每个教程章节包含：学习目标、设计动机、核心原理与架构（含 mermaid 图）、源码关键点（含 file:line 证据）、与其他模块关系、小结与思考题、延伸阅读。
+
+**权威开发指南**（OmniStream/.claude/skills/ 下）：
+
+- 表达式开发指南（权威总纲，63KB，6 部分+附录：全链路与分类/框架核心原理/Type A-D 实操示例/json_value 深度案例/参考规范/排错与调试）
+- 表达式开发路径选择（向量化 vs codegen，三范式决策矩阵）
+- 表达式开发文件清单（按仓库×类型组织，两必踩坑，ABS 完整示例）
+
+---

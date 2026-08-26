@@ -1,43 +1,32 @@
-# 项目目标
-参考模板 ppt.md
-撰写ppt的文本内容
+# 实习工作详述
 
-汇总过去两个月（2026.7-2026.8）的实习内容 不含自己独立的项目
-然后总结出ppt的文本内容
+> 2026.07—2026.08 两个月实习工作详尽记录，按项目与主题组织，保留具体技术细节、问题与方案、量化数据。
+>
+> 实习人：田沛康　部门：SAIE业务域　导师：向云武　直接主管：李兆星
 
-# 参考资料
-1.每日的日志记录
-D:\Myknows\日志
-2.两个项目
-2.1 OmniStream
-负责OmniStream项目的表达式开发
-D:\Project\Work
-D:\Myknows\项目\Omni大数据
-https://gitcode.com/openeuler/OmniStream
-https://gitcode.com/openeuler/OmniAdaptor
-https://gitcode.com/openeuler/OmniOperator
+## 文档结构
 
-2.2 AgentOS
-负责PPT-Agentskill的(主researcher部分)开发和调优
-D:\Project\Agent
-D:\Myknows\项目\一体机办公agent
-https://gitcode.com/hellokitty911/ppt-pipeline-swarm/tree/ppt_agent
+| 文件 | 内容 | 行数 |
+|---|---|---|
+| [01-实习概述.md](01-实习概述.md) | 基本信息、五条实习目标、两个项目定位、主线时间线 | 47 |
+| [02-OmniStream项目.md](02-OmniStream项目.md) | 项目背景、三仓库双层架构、编译流程、表达式开发（5阶段/Type ABCD/双后端/12表达式）、3 个深度案例、9 个问题与方案、开发工具链、文件清单、知识库 | 845 |
+| [03-AgentOS项目-架构与公式.md](03-AgentOS项目-架构与公式.md) | 项目背景、九问平台 8 核心仓、4 角色流水线、研究员开发、.trace/ 可观察性、PPTv2agent 参考与源码、27 PPT 方案分级、框架比较、公式原生插入（4 轮迭代/inject_omml 函数级/8 项目对比/banana-slides 源码/样式与文字约束调研） | 699 |
+| [04-AgentOS项目-调优与质量.md](04-AgentOS项目-调优与质量.md) | 调优与大重构（workbuddy-align/designer-opt/feat-native-preserve-v2/refactor 各分支完整 commit 清单）、纯净原则审计、校验脚本体系（inspect_slide/verify_deck/build_deck/preflight）、tencent-pptx 三处调优、PresentBench 30 条 + 三 agent 产物原则 | 295 |
+| [05-Wiki产出与方法论.md](05-Wiki产出与方法论.md) | 21 篇 Wiki 文稿四类清单（基础学习/知识拓展/工作指南/工程实践）+ 统计、15 条方法论沉淀 | 79 |
+| [06-时间线与每日纪要.md](06-时间线与每日纪要.md) | 30+ 关键节点时间线、9 周每日工作纪要（保留日记级细节） | 227 |
 
-# 展示面的约束
-大量深度的调研各类参考资料 包括本地的和网上的资料
-以模板为主  目前的ppt还是拷贝同事的 内容不确定 但是框架定好了
-主要填充：
-1.学习及工作内容介绍 个人相关/工作相关
-2.两个项目的简单介绍 项目背景（项目介绍）+个人产出（遇到的问题 解决的方案）
-OmniStream 你自己设计 主要在项目介绍上
-AgentOS 重点介绍PPT-Agentskill 然后介绍PPTv2agent 然后我们这个skill的框架比较
-个人产出的话 可以重点放在公式原生插入的解决上
+## 两个项目
 
-# wiki产出
-D:\Project\Agent\docs这是粗文稿
-你可以看看 wiki从里面产出 主要是一些解读 一些调研这块 
+| 项目 | 周期 | 角色 | 核心工作 |
+|---|---|---|---|
+| OmniStream | 7月上中旬 | 表达式开发 | SQL 表达式原生加速、bug 修复、编译流程、工具链 |
+| AgentOS / PPT-Agentskill | 7月下旬—8月 | 研究员部分开发与调优 | 4 角色流水线落地、可观察性、公式原生插入、大重构 |
 
-# 约束
-其他的内容你自己填一下 重点是整个模板框架
-图片的话 你先用mermaid代替
+## 素材来源
 
+- 每日日志记录（D:\Myknows\日志，25 篇每日 + 6 篇周记）
+- 两个项目本地资料（D:\Project\Work、D:\Project\Agent）
+- Wiki 粗文稿（D:\Project\Agent\docs，21 篇）
+- 九问平台研究（D:\Myknows\项目\一体机办公agent\openjiuwen，8 核心仓）
+- 27 PPT 方案调研（D:\Myknows\项目\一体机办公agent\PPT工作流）
+- 网上调研（OmniStream/openEuler、OMML 技术、PPT-agent 竞品框架）

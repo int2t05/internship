@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head><meta charset="UTF-8"><link rel="stylesheet" href="global.css"></head>
+<body>
+<!-- page-type: bigimage -->
+<div class="region-header"><h1>项目背景：OmniStream —— 基于 Flink 生态的流处理性能加速</h1></div>
+<div class="region-content">
+<div class="bigimg-wrap">
+  <div class="bigimg-figure"><img src="../images/mmd_07.png" alt="Flink 瓶颈与 OmniStream 对策"></div>
+  <div class="bigimg-points points"><ul>
+    <li>Flink 跑在 JVM 上，高负载下三类瓶颈</li>
+    <li>内存回收停顿打断低延迟，字节码预热慢，热点才编译</li>
+    <li>对象序列化开销逐条放大</li>
+    <li>OmniStream 用 C++ 重写算子，配合向量化 SIMD 指令</li>
+    <li>消除 JVM 开销，端到端提升流处理性能</li>
+  </ul></div>
+</div>
+</div>
+<div class="region-footer"><div>田沛康 · SAIE 业务域</div><div>7/22</div></div>
+</body>
+</html>

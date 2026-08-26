@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head><meta charset="UTF-8"><link rel="stylesheet" href="global.css"></head>
+<body>
+<!-- page-type: table -->
+<div class="region-header"><h1>三仓库双层架构：Java 适配层 + C++ 核心层</h1></div>
+<div class="region-content">
+<div class="table-wrap table-with-figure">
+  <div class="bigimg-figure"><img src="../images/mmd_08.png" alt="三仓库双层架构"></div>
+  <div class="table-scroll">
+    <table>
+      <colgroup><col style="width:26%"><col style="width:44%"><col style="width:30%"></colgroup>
+      <thead><tr><th>仓库</th><th>职责</th><th>产物</th></tr></thead>
+      <tbody>
+        <tr><td class="highlight">OmniStream</td><td>原生运行时框架</td><td>libtnel.so</td></tr>
+        <tr><td class="highlight">OmniAdaptor</td><td>Flink 桥接与算子替换决策</td><td>flink-tnel.jar</td></tr>
+        <tr><td class="highlight">OmniOperator</td><td>底层向量化算子内核</td><td>5×.so + 2×.jar</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="summary-line"><p>零侵入接入：只改两个配置文件，不改 Flink 内核代码；不支持算子自动回退 Flink 原生 Java</p></div>
+</div>
+</div>
+<div class="region-footer"><div>田沛康 · SAIE 业务域</div><div>8/22</div></div>
+</body>
+</html>

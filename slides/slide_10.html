@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head><meta charset="UTF-8"><link rel="stylesheet" href="global.css"></head>
+<body>
+<!-- page-type: table -->
+<div class="region-header"><h1>表达式开发案例：三类范式覆盖</h1></div>
+<div class="region-content">
+<div class="table-wrap">
+  <div class="table-scroll">
+    <table>
+      <colgroup><col style="width:22%"><col style="width:26%"><col style="width:52%"></colgroup>
+      <thead><tr><th>案例</th><th>范式</th><th>要点</th></tr></thead>
+      <tbody>
+        <tr><td class="highlight">IFNULL</td><td>别名映射</td><td>语义等价已有函数，一行映射完成原生化</td></tr>
+        <tr><td class="highlight">LEFT/RIGHT</td><td>纯向量化</td><td>按 UTF-8 码点切片，绝不切断多字节字符</td></tr>
+        <tr><td class="highlight">BETWEEN</td><td>借原语编译</td><td>语义可拆成两个比较，借已有原语组合执行</td></tr>
+        <tr><td class="highlight">SIMILAR TO</td><td>专用函数</td><td>正则不可拆，需专用函数解释执行</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="summary-line"><p>一映射、一向量化、一组合、一专用：四类范式覆盖表达式开发全场景</p></div>
+</div>
+</div>
+<div class="region-footer"><div>田沛康 · SAIE 业务域</div><div>10/22</div></div>
+</body>
+</html>

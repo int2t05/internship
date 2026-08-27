@@ -311,38 +311,47 @@ PPT-Agentskill是九问平台上的4角色专门化流水线。单一失败模�
 
 PPTv2agent参考与skill框架比较
 
-- DeepPresenter（PPTv2agent）：ACL2026 SOTA，双 Agent + 渲染反思
+- DeepPresenter（PPTAgent v2）：ACL2026 SOTA，均分 4.44 超 Gamma 4.36
+- 双 Agent 架构：Researcher 检索 + Presenter 生成 + 渲染反思
 - 本 skill：平台工程落地，4 角色流水线 + 脚本校验
-- 设计器引擎源自 PPTAgent v2 提取重写为独立 CLI
 
 ```mermaid
 flowchart LR
-    subgraph A["PPTv2agent · 学术方法"]
-        A1["双 Agent 反思<br/>渲染像素图反馈"]
+    subgraph V["PPTv2agent · 学术方法"]
+        V1["Researcher<br/>深度检索"]
+        V2["Presenter<br/>设计生成"]
+        V3["渲染像素图<br/>环境接地反思"]
+        V1 -->|"共享观察空间"| V2
+        V2 --> V3
+        V3 -.->|"反馈修正"| V2
     end
-    subgraph B["标准 swarm-skill"]
-        B1["工具跑原语<br/>脚本内嵌校验"]
+    subgraph S["标准 swarm-skill"]
+        S1["工具跑原语<br/>脚本内嵌"]
     end
-    subgraph C["本 skill · 工程落地"]
-        C1["手动建队编排<br/>脚本+LLM 双层"]
+    subgraph O["本 skill · 工程落地"]
+        O1["4 角色流水线<br/>脚本+LLM 双层"]
+        O2["转达协议<br/>断点续跑"]
+        O1 --> O2
     end
-    A -.看齐内容风格.-> C
-    B -.简化编排.-> C
+    V -.看齐内容风格.-> O
+    S -.简化编排.-> O
     classDef sota fill:#E8F5E9,stroke:#2E7D32
     classDef std fill:#F7F9FC,stroke:#8B97A8
     classDef our fill:#E8EFF8,stroke:#1E4FA8
-    class A sota
-    class B std
-    class C our
+    class V sota
+    class S std
+    class O our
 ```
 
-选型依据：固定流水线 + 断点续跑 → 编排式；一人用 + 流程灵活 → 单 Agent 自包含。
+设计器引擎源自 PPTAgent v2 提取重写为独立 CLI，去掉了 v2 的 MCP/agent environment 依赖，适配 swarm-skill 调用模式。
 
 ### Notes:
 
-PPTv2agent 即 PPTAgent v2 又称 DeepPresenter，当前学术 SOTA，评测均分 4.44 超商业系统 Gamma 4.36，双 Agent 共享观察空间加环境接地反思。看齐其内容风格五条：信息加工成半成品、每页围绕一个核心洞察、金字塔原则主题句领起、图片承载信息而非填空、优先可信来源。
+PPTv2agent 即 PPTAgent v2（EMNLP 2025），又称 DeepPresenter（ACL 2026），当前学术 SOTA，评测均分 4.44 超商业系统 Gamma 4.36。架构为 Researcher + Presenter 双 Agent 共享观察空间，加环境接地反思——每页生成后 inspect_slide 渲染成像素图供视觉反思修正。还提供推荐微调模型 DeepPresenter-9B。
 
-本 skill 相比标准 swarm-skill 简化为手动编排，更适合固定流水线与断点续跑，人机交互用转达协议替代原语。相比 PPTv2agent 学术方法是双 Agent 反思，本 skill 是平台上的工程实现，4 角色分工加脚本校验。设计器引擎源自 PPTv2agent 提取重写为独立 CLI。
+看齐其内容风格五条（Content Style Guidelines）：① 追求信息美学，信息加工成半成品而非原材料，图作视觉焦点；② 每页围绕一个核心洞察，深度分析提炼高价值结论；③ 金字塔原则，主题句领起，仅首次术语和关键结论加粗；④ 图片即内容，基于页面高度抽象与核心隐喻，禁通用商务占位图；⑤ 优先可信来源（arxiv/wikipedia/官方/权威媒体）。
+
+本 skill 相比标准 swarm-skill 简化为手动编排（建队→派角色→建任务依赖），更适合固定流水线与断点续跑，人机交互用转达协议（标记前缀让队长识别必须转达）替代原语。相比 PPTv2agent 学术方法是双 Agent 渲染反思，本 skill 是平台上的工程实现，4 角色分工加脚本校验（脚本硬校验管结构，LLM 自审管语义）。设计器引擎 html2pptx 源自 PPTAgent v2 提取重写为独立 CLI，去掉了 v2 的 MCP/agent environment 依赖。选型依据：固定流水线加断点续跑走编排式，一人用加流程灵活走单 Agent 自包含。
 
 ---
 

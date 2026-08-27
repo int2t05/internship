@@ -309,55 +309,38 @@ PPT-Agentskill是九问平台上的4角色专门化流水线。单一失败模�
 
 ---
 
-PPTv2agent参考：DeepPresenter双Agent架构与Content Style
+PPTv2agent参考与skill框架比较
 
-- DeepPresenter：ACL2026 SOTA（均分 4.44 超 Gamma 4.36）
-- 双 Agent 共享观察空间 + 环境接地反思
-- 定位：学术参考方法论，PPT-Agentskill 是工程落地
+- DeepPresenter（PPTv2agent）：ACL2026 SOTA，双 Agent + 渲染反思
+- 本 skill：平台工程落地，4 角色流水线 + 脚本校验
+- 设计器引擎源自 PPTAgent v2 提取重写为独立 CLI
 
 ```mermaid
 flowchart LR
-    subgraph R["Researcher · 深度检索"]
-        R1["半成品非原材料"]
-        R2["每页一核心洞察"]
+    subgraph A["PPTv2agent · 学术方法"]
+        A1["双 Agent 反思<br/>渲染像素图反馈"]
     end
-    subgraph P["Presenter · 设计生成"]
-        P1["图承载信息"]
-        P2["优先可信来源"]
+    subgraph B["标准 swarm-skill"]
+        B1["工具跑原语<br/>脚本内嵌校验"]
     end
-    R -->|"共享观察空间"| P
-    P -->|"渲染像素图"| F["环境接地反思"]
-    F -.->|"反馈修正"| P
-    classDef res fill:#E8EFF8,stroke:#1E4FA8
-    classDef pres fill:#E8F5E9,stroke:#2E7D32
-    classDef fb fill:#FFF3E0,stroke:#FFC107
-    class R res
-    class P pres
-    class F fb
+    subgraph C["本 skill · 工程落地"]
+        C1["手动建队编排<br/>脚本+LLM 双层"]
+    end
+    A -.看齐内容风格.-> C
+    B -.简化编排.-> C
+    classDef sota fill:#E8F5E9,stroke:#2E7D32
+    classDef std fill:#F7F9FC,stroke:#8B97A8
+    classDef our fill:#E8EFF8,stroke:#1E4FA8
+    class A sota
+    class B std
+    class C our
 ```
 
-DeepPresenter（PPTAgent v2）是当前学术 SOTA，双 Agent 共享观察空间 + 环境接地反思，PPT-Agentskill 是其在九问平台上的工程实现。
+选型依据：固定流水线 + 断点续跑 → 编排式；一人用 + 流程灵活 → 单 Agent 自包含。
 
 ### Notes:
 
-PPTv2agent即PPTAgent v2又称DeepPresenter，是当前学术SOTA，评测均分4.44超越商业系统Gamma的4.36。架构为Researcher加Presenter双agent共享观察空间，加环境接地反思——渲染成像素图反馈修正。看齐其信息美学内容风格五条：信息加工成半成品而非原材料、每页围绕一个核心洞察、金字塔原则主题句领起、图片承载信息而非填空、优先可信来源。它是学术参考方法论，PPT-Agentskill是在九问平台上落地的工程实现。设计器引擎源自其提取重写为独立CLI。
-
----
-
-skill框架比较：ppt-pipeline-swarm vs 标准swarm-skill vs PPTv2agent
-
-| 维度     | 标准swarm-skill | ppt-pipeline-swarm |
-| -------- | --------------- | ------------------ |
-| 编排     | 工具跑原语      | 手动建队编排       |
-| 质量门   | 脚本内嵌        | 脚本+LLM双层       |
-| 人机交互 | 原语            | 转达协议           |
-
-- 相比标准形态：简化为手动编排，适合固定流水线
-- 相比 PPTv2agent：平台上的工程实现，非学术方法
-- 设计器引擎源自 PPTAgent v2 提取重写为独立 CLI
-
-本 skill 相比标准多角色 skill 简化为手动编排，更适合固定流水线与断点续跑。人机交互用转达协议——标记前缀让队长识别必须转达，替代原语。相比 PPTAgent v2 学术方法是双 Agent 反思，本 skill 是平台上的工程实现，4 角色分工加脚本校验。选型依据：固定流水线加断点续跑走编排式，一人用加流程灵活走单 agent 自包含。
-
+PPTv2agent即PPTAgent v2又称DeepPresenter，当前学术SOTA，评测均分4.44超商业系统Gamma 4.36，双Agent共享观察空间加环境接地反思。看齐其内容风格五条：信息加工成半成品、每页围绕一个核心洞察、金字塔原则主题句领起、图片承载信息而非填空、优先可信来源。本skill相比标准swarm-skill简化为手动编排，更适合固定流水线与断点续跑，人机交互用转达协议替代原语。相比PPTv2agent学术方法是双Agent反思，本skill是平台上的工程实现，4角色分工加脚本校验。设计器引擎源自PPTv2agent提取重写为独立CLI。
 ---
 
 项目背景： 公式原生插入--可编辑OMML方程而非图片

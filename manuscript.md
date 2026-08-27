@@ -180,55 +180,33 @@ SQL → OmniAdaptor 注入 JSON 并决策替换 → OmniTask 经 JNI 调 libtnel
 
 ---
 
-表达式开发总览：让SQL表达式走Native加速路径
+表达式开发：SQL表达式走Native加速路径
 
 - 5 阶段：规划 → 部署 → 解析 → 编译 → 运行
-- 四类：A 标量 / B 特殊语法 / C 聚合 / D 别名
-- 选路：优先向量化，不行才 codegen，都不行回退 Java
+- 代码位置：functions/*.{h,cpp} 造函数，codegen/*.cpp 接 JIT，jsonparser 建 Expr 节点
 
 ```mermaid
 flowchart TD
     E["表达式"] --> P{可向量化?}
-    P -->|是 90%+| V["向量化 Apply"]
+    P -->|是 90%+| V["向量化 Apply<br/>functions/*.cpp"]
     P -->|否| C{可 JIT?}
-    C -->|是| G["codegen 机器码"]
+    C -->|是| G["codegen 机器码<br/>codegen/*.cpp"]
     C -->|否| J["回退 Java"]
-    G --> M["ExprEval"]
-    V --> M
     classDef ok fill:#E8F5E9,stroke:#2E7D32
     classDef dec fill:#FFF3E0,stroke:#FFC107
     classDef bad fill:#FDECEA,stroke:#D9534F
-    class V,G,M ok
+    class V,G ok
     class P,C dec
     class J bad
 ```
 
-选路公式：优先向量化，不行才 codegen，都不行回退 Java。
-
-### Notes:
-
-表达式开发就是让Flink SQL中的表达式走OmniStream Native向量化执行路径，替代Flink原生Java执行。一条表达式从SQL到Native执行经历五阶段：规划期识别表达式翻译JSON、部署期嵌入算子链、解析期转表达式树、编译期验证并编译、运行期批量向量化执行。按表达式特点分四类：Type A标量函数、Type B特殊语法、Type C聚合函数、Type D SQL别名。每类有对应开发范式。执行路径两条：向量化（预写列函数覆盖广）与即时编译（编译成机器码表达式融合）。优先向量化，不行才即时编译，都不行回退Java。
-
----
-
-表达式开发案例：三类范式覆盖
-
-| 案例       | 范式       | 要点                    |
-| ---------- | ---------- | ----------------------- |
-| IFNULL     | 别名映射   | 一行代码完成原生化      |
-| LEFT/RIGHT | 纯向量化   | Unicode安全，码点不截断 |
-| BETWEEN    | 借原语编译 | 语义可拆，组合执行      |
-
 ```mermaid
 flowchart TD
     S["开发表达式"] --> Q1{普通函数?}
-    Q1 -->|是| A["A 纯向量化<br/>造函数 + 注册"]
-    Q1 -->|否 自定义语法| Q2{能拆原语?}
-    Q2 -->|是| B["B codegen 下放<br/>lower 到原语"]
-    Q2 -->|否| C["C 专用函数<br/>ExprEval 调 Apply"]
-    A --> L["标杆 LEFT/IFNULL"]
-    B --> LB["标杆 BETWEEN"]
-    C --> LC["标杆 SIMILAR TO"]
+    Q1 -->|是| A["A 纯向量化<br/>functions/ + Register"]
+    Q1 -->|否| Q2{能拆原语?}
+    Q2 -->|是| B["B codegen 下放<br/>codegen Visit lower"]
+    Q2 -->|否| C["C 专用函数<br/>Expr 节点 + functions/"]
     classDef a fill:#E8F5E9,stroke:#2E7D32
     classDef b fill:#E8EFF8,stroke:#1E4FA8
     classDef c fill:#FFF3E0,stroke:#FFC107
@@ -237,42 +215,42 @@ flowchart TD
     class C c
 ```
 
-判据：能拆原语借原语（B），拆不开造函数（C），普通函数造函数（A）。
+四类代码位置：① functions/*.{h,cpp} + Register 造可复用向量化函数；② expressions.{h,cpp} + jsonparser 建 Expr AST 节点；③ codegen/functions/*.cpp 逐行 JIT 函数；④ batch_expression_codegen.cpp 为 Expr 节点写 LLVM Visit。三范式：A 只造函数，B 建 Expr + codegen lower，C 建 Expr + 造函数。三仓库统一分支 2026_930_poc，每表达式独立分支开发后提 PR。
 
 ### Notes:
 
-三个案例覆盖不同开发范式。IFNULL语义等价两参COALESCE，在适配层加一行映射，整链按COALESCE走，内核零改动。一行代码完成一个表达式的原生化。LEFT和RIGHT是镜像的真正native字符串函数，按UTF-8码点步进切片，绝不切断多字节字符。空值由框架自动传播。BETWEEN的语义能拆成两个不大于判断，借已有向量化原语组合执行，不需要新写函数。SIMILAR TO是正则不可拆，需专用函数解释执行。
+表达式开发让Flink SQL表达式走OmniStream Native向量化执行路径，替代Flink原生Java执行。一条表达式从SQL到Native经历五阶段：规划期识别翻译JSON、部署期嵌入算子链、解析期转表达式树、编译期验证并编译、运行期批量向量化。按特性分四类：A标量、B特殊语法、C聚合、D别名。执行两路径：向量化预写列函数覆盖广，codegen是LLVM JIT编译成机器码支持融合。优先向量化，不行才即时编译，都不行回退Java。三范式：IFNULL别名映射COALESCE一行完成，LEFT/RIGHT按UTF-8码点切片NULL自动传播，BETWEEN借lessThanEqual原语组合，SIMILAR TO正则不可拆造专用函数。
 
 ---
 
-问题排查：BETWEEN崩溃定位与vanilla对照组二分法
+表达式开发产出：7个表达式落地
 
-- 问题：BETWEEN 在反向区间 low > high 时崩溃
-- 方法：同一用例同时跑原生 Flink 与 native 对比
-- 价值：让"甩锅还是背锅"有客观依据
+- 7 个表达式全部提 PR，走通设计→实现→审计→修复全链路
+- 覆盖四类范式，验证 native == vanilla 归一化逐行一致
+- 沉淀 vanilla 对照组二分法做 bug 归因
 
 ```mermaid
-flowchart TD
-    B["崩溃: BETWEEN 反向区间"] --> V{原生 Flink 也崩?}
-    V -->|是 投影路径| U["上游缺陷<br/>Flink Sarg 源码 bug"]
-    V -->|否 过滤路径| N["本侧 bug<br/>FilterCodeGen 崩"]
-    U --> R1["规避输入，不做 golden"]
-    N --> R2["修复 BetweenExpr"]
-    classDef bug fill:#FDECEA,stroke:#D9534F
-    classDef dec fill:#FFF3E0,stroke:#FFC107
-    classDef up fill:#F7F9FC,stroke:#8B97A8
-    classDef fix fill:#E8F5E9,stroke:#2E7D32
-    class B,N bug
-    class V dec
-    class U,R1 up
-    class R2 fix
+flowchart LR
+    A["IFNULL<br/>D 别名映射"] --- B["LEFT/RIGHT<br/>A 纯向量化"]
+    B --- C["BETWEEN<br/>B 借原语"]
+    C --- D["SIMILAR TO<br/>C 专用函数"]
+    D --- E["NOT IN/EXISTS<br/>B 语法"]
+    E --- F["PARSE_URL/TYPEOF<br/>A 简单函数"]
+    classDef d fill:#FFF3E0,stroke:#FFC107
+    classDef a fill:#E8F5E9,stroke:#2E7D32
+    classDef b fill:#E8EFF8,stroke:#1E4FA8
+    classDef c fill:#FDECEA,stroke:#D9534F
+    class A d
+    class B,F a
+    class C,E b
+    class D c
 ```
 
-用 vanilla 原生 Flink 做对照组：投影路径也崩是 Flink 源码 bug（规避），过滤路径 native 崩是本侧 bug（修复）。
+7 个表达式覆盖全部四类开发范式，每个独立分支开发后提 PR，全程经 vanilla 对照组二分法验证。
 
 ### Notes:
 
-开发BETWEEN时发现崩溃，但不确定是Flink/Calcite上游缺陷还是本侧native实现bug。用vanilla也就是原生Flink做对照组：把同一用例同时跑在原生Flink与Omni原生实现上对比。原生也崩说明是Flink 1.16.3源码缺陷，与Omni无关，测试主动规避这类输入。原生正常而Omni崩说明是本侧bug，修复。这让"甩锅还是背锅"有了客观依据。过程中还解决了注册名大小写敏感、静默回退、类型错位等多个工程问题，均沉淀进开发工具与文档。
+7个表达式覆盖全部四类开发范式：IFNULL别名映射COALESCE一行完成，LEFT/RIGHT按UTF-8码点切片，BETWEEN借lessThanEqual原语组合，SIMILAR TO正则不可拆造专用函数，NOT IN/EXISTS走算子级路径，PARSE_URL/TYPEOF简单函数向量化。每个表达式独立分支开发后提PR，全程经vanilla对照组二分法验证native==vanilla归一化逐行一致，过程中解决注册名大小写、静默回退、类型错位等工程问题。
 
 ---
 

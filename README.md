@@ -1,5 +1,7 @@
 # 实习工作详述
 
+> **仓库定位**：维护答辩 PPT 文稿 `manuscript.md`（21 页，含 mermaid 图）。`render_mermaid.py` 把图中 mermaid 渲染成 `images/mmd_XX.png`。文稿生成 pptx 由 [ppt-pipeline-swarm](../Agent/ppt-pipeline-swarm) skill 的 stage 4 负责，不在本仓库。
+
 > 2026.07—2026.08 两个月实习工作详尽记录，按项目与主题组织，保留具体技术细节、问题与方案、量化数据。
 >
 > 实习人：田沛康　部门：SAIE业务域　导师：向云武　直接主管：李兆星

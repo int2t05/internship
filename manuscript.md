@@ -1,6 +1,6 @@
 # 实习生答辩
 
-员工：田沛康                                           部门：SAIE业务域
+员工：田沛康                                           部门：业务部门
 导师：向云武		      	       直接主管：李兆星
 Security Level:
 
@@ -39,15 +39,15 @@ Security Level:
 
 工作经历
 2026.07 - 至今
-华为  Omni生态 大数据方向
+华为  业务线 软件方向
 
 入职华为
 2026.07.01
-SAIE业务域（ICT BG) AI应用工程师
+业务部门（ICT BG) AI应用工程师
 
 ### Notes:
 
-本次答辩汇报两个月实习工作。实习聚焦华为Omni生态两个项目：7月上中旬OmniStream表达式开发，7月下旬至8月AgentOS的PPT-Agentskill开发。从大数据基础学习切入，逐步深入到Native算子开发与Agent工程化。
+本次答辩汇报两个月实习工作。实习聚焦华为业务线两个项目：7月上中旬流处理加速表达式开发，7月下旬至8月AgentOS的PPT-Agentskill开发。从大数据基础学习切入，逐步深入到Native算子开发与Agent工程化。
 
 ---
 
@@ -78,14 +78,14 @@ SAIE业务域（ICT BG) AI应用工程师
 
 | 分类     | 工作学习任务                                                                                                                                                                                                           | 输出和收获                                                                                                                               |
 | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| 个人相关 | 1、大数据基础学习（Flink/Spark/鲲鹏920 ARM生态） 2、电商日志全流程（Flume→Kafka→Spark→Hive） 3、Agent生态调研（九问平台、27方案） 4、开发工具链建设（6+构建+审计skill）                                             | 建立流处理全貌认知 走通编译部署全流程 形成完整编译地图 理清skill→workflow执行链路 固化构建→测试→审计一条命令化                        |
-| 工作相关 | 1、OmniStream 8类SQL表达式原生化（ISNULL/LEFT-RIGHT/BETWEEN/NOT IN/EXISTS/SIMILAR TO等） 2、bug修复（BetweenExpr崩溃/注册名错位/静默回退） 3、PPT-Agentskill开发与调优（4角色流水线/.trace/公式原生插入/大重构PR#7#8） | 10+表达式提PR 走通设计→审计→修复全链路 确立vanilla对照组二分法 4角色流水线落地 26公式WPS验证通过 27文件纯净审计15必修 21篇Wiki约34万字 |
+| 个人相关 | 1、大数据基础学习（Flink/Spark/ARM 架构） 2、电商日志全流程（Flume→Kafka→Spark→Hive） 3、Agent生态调研（九问平台、27方案） 4、开发工具链建设（6+构建+审计skill）                                             | 建立流处理全貌认知 走通编译部署全流程 形成完整编译地图 理清skill→workflow执行链路 固化构建→测试→审计一条命令化                        |
+| 工作相关 | 1、流处理加速 8类SQL表达式原生化（ISNULL/LEFT-RIGHT/BETWEEN/NOT IN/EXISTS/SIMILAR TO等） 2、bug修复（BetweenExpr崩溃/注册名错位/静默回退） 3、PPT-Agentskill开发与调优（4角色流水线/.trace/公式原生插入/大重构PR#7#8） | 10+表达式提PR 走通设计→审计→修复全链路 确立vanilla对照组二分法 4角色流水线落地 26公式WPS验证通过 27文件纯净审计15必修 21篇Wiki约34万字 |
 
 Page
 
 ### Notes:
 
-学习与工作交织推进。个人相关打基础：大数据基础学习建立流处理全貌认知，Agent生态调研理清skill驱动机制，开发工具链固化一条命令化。工作相关出产出：OmniStream 8类表达式原生化10+提PR，bug修复确立vanilla二分法，PPT-Agentskill 4角色流水线落地加26公式WPS验证，调优完成HITL显式化与大重构PR#7#8及27文件纯净审计15必修。21篇Wiki约34万字沉淀全程。
+学习与工作交织推进。个人相关打基础：大数据基础学习建立流处理全貌认知，Agent生态调研理清skill驱动机制，开发工具链固化一条命令化。工作相关出产出：流处理加速 8类表达式原生化10+提PR，bug修复确立vanilla二分法，PPT-Agentskill 4角色流水线落地加26公式WPS验证，调优完成HITL显式化与大重构PR#7#8及27文件纯净审计15必修。21篇Wiki约34万字沉淀全程。
 
 ---
 
@@ -112,7 +112,7 @@ Page
 
 ---
 
-项目背景： OmniStream--基于Flink生态的流处理性能加速项目
+项目背景： 流处理加速--基于Flink生态的流处理性能加速项目
 
 - GC 停顿打断低延迟
 - JIT 预热慢，热点才编译
@@ -123,23 +123,23 @@ flowchart LR
     subgraph Flink["Flink on JVM · 瓶颈"]
         A1["GC 停顿"] --> A2["JIT 预热"] --> A3["序列化"]
     end
-    subgraph Omni["OmniStream · Native 对策"]
+    subgraph Native["流处理加速 · Native 对策"]
         B1["C++ 算子"] --> B2["SIMD 向量化"] --> B3["整链下沉"] --> B4["状态缓存"]
     end
     A1 -.消除.-> B1
     A2 -.消除.-> B2
     A3 -.消除.-> B3
     classDef jvm fill:#FDECEA,stroke:#D9534F
-    classDef omni fill:#E8EFF8,stroke:#1E4FA8
+    classDef native fill:#E8EFF8,stroke:#1E4FA8
     class Flink jvm
-    class Omni omni
+    class Native native
 ```
 
-OmniStream 用 C/C++ 重写 Flink 算子，配合 AArch64 向量化指令，在不改 Flink 一行代码的前提下端到端提升性能。
+流处理加速 用 C/C++ 重写 Flink 算子，配合 AArch64 向量化指令，在不改 Flink 一行代码的前提下端到端提升性能。
 
 ### Notes:
 
-OmniStream是openEuler社区、华为鲲鹏BoostKit大数据OmniRuntime生态中面向Apache Flink的流计算Native化加速项目。核心思路是用C/C++重写Flink的SQL与DataStream算子，配合鲲鹏AArch64的SIMD向量化指令，在不改Flink一行代码的前提下端到端提升性能。Flink跑在JVM上，高负载下有三类瓶颈：GC停顿打断低延迟、字节码先解释执行预热慢、对象序列化开销大。共同根源是"JVM托管执行+行式对象模型"。OmniStream四招对症下药：C++写算子消除JVM开销、SIMD向量化批量算、整条算子链下沉Native减少JNI往返、状态缓存降低RocksDB磁盘IO。项目适配Flink 1.16.3，当前版本1.3.0。
+流处理加速是开源社区运行时优化生态中面向Apache Flink的流计算Native化加速项目。核心思路是用C/C++重写Flink的SQL与DataStream算子，配合AArch64的SIMD向量化指令，在不改Flink一行代码的前提下端到端提升性能。Flink跑在JVM上，高负载下有三类瓶颈：GC停顿打断低延迟、字节码先解释执行预热慢、对象序列化开销大。共同根源是"JVM托管执行+行式对象模型"。流处理加速四招对症下药：C++写算子消除JVM开销、SIMD向量化批量算、整条算子链下沉Native减少JNI往返、状态缓存降低RocksDB磁盘IO。项目适配Flink 1.16.3，当前版本1.3.0。
 
 ---
 
@@ -151,14 +151,14 @@ OmniStream是openEuler社区、华为鲲鹏BoostKit大数据OmniRuntime生态中
 
 ```mermaid
 flowchart LR
-    subgraph Adaptor["OmniAdaptor · Java"]
+    subgraph Adaptor["适配层 · Java"]
         A1["注入 JSON"] --> A2["替换决策"] --> A3["Task 替换"]
     end
-    subgraph Stream["OmniStream · C++ 运行时"]
-        B1["OmniTask"] --> B2["OperatorChain"]
+    subgraph Stream["流处理加速 · C++ 运行时"]
+        B1["任务模块"] --> B2["OperatorChain"]
     end
-    subgraph Operator["OmniOperator · 向量化内核"]
-        C1["LLVM JIT"] --> C2["OmniVec 列式"] --> C3["150+ 函数"]
+    subgraph Operator["算子模块 · 向量化内核"]
+        C1["LLVM JIT"] --> C2["向量化模块 列式"] --> C3["150+ 函数"]
     end
     A3 -->|JNI| B1
     B2 -->|.so| C1
@@ -172,7 +172,7 @@ flowchart LR
     class F fb
 ```
 
-SQL → OmniAdaptor 注入 JSON 并决策替换 → OmniTask 经 JNI 调 libtnel.so → Mailbox 驱动算子链 → OmniOperator 向量化执行 → 结果回流 Flink。
+SQL → 适配层 注入 JSON 并决策替换 → 任务模块 经 JNI 调 libtnel.so → Mailbox 驱动算子链 → 算子模块 向量化执行 → 结果回流 Flink。
 
 ### Notes:
 
@@ -219,7 +219,7 @@ flowchart TD
 
 ### Notes:
 
-表达式开发让Flink SQL表达式走OmniStream Native向量化执行路径，替代Flink原生Java执行。一条表达式从SQL到Native经历五阶段：规划期识别翻译JSON、部署期嵌入算子链、解析期转表达式树、编译期验证并编译、运行期批量向量化。按特性分四类：A标量、B特殊语法、C聚合、D别名。执行两路径：向量化预写列函数覆盖广，codegen是LLVM JIT编译成机器码支持融合。优先向量化，不行才即时编译，都不行回退Java。三范式：IFNULL别名映射COALESCE一行完成，LEFT/RIGHT按UTF-8码点切片NULL自动传播，BETWEEN借lessThanEqual原语组合，SIMILAR TO正则不可拆造专用函数。
+表达式开发让Flink SQL表达式走流处理加速 Native向量化执行路径，替代Flink原生Java执行。一条表达式从SQL到Native经历五阶段：规划期识别翻译JSON、部署期嵌入算子链、解析期转表达式树、编译期验证并编译、运行期批量向量化。按特性分四类：A标量、B特殊语法、C聚合、D别名。执行两路径：向量化预写列函数覆盖广，codegen是LLVM JIT编译成机器码支持融合。优先向量化，不行才即时编译，都不行回退Java。三范式：IFNULL别名映射COALESCE一行完成，LEFT/RIGHT按UTF-8码点切片NULL自动传播，BETWEEN借lessThanEqual原语组合，SIMILAR TO正则不可拆造专用函数。
 
 ---
 
@@ -456,7 +456,7 @@ flowchart LR
 
 收获：
 代码开发能力提高，C++/Java 混合栈开发走通全链路
-熟悉 OmniStream 流处理 Native 加速业务与编译构建流程
+熟悉 流处理加速 Native 加速业务与编译构建流程
 熟悉九问 Agent 平台生态与 PPT 流水线工程化
 方法论沉淀：vanilla 二分法、只读旁路、纯净原则审计
 认知升级：工具是行为约束，隐式交互脆弱，完整≠能用
@@ -486,9 +486,9 @@ quadrantChart
 
 ### Notes:
 
-两个月实习在工程能力、业务理解与方法论上显著成长。工程能力：C++/Java 混合栈开发，OmniStream 10+ 表达式提 PR 走通设计→实现→审计→修复全链路，Agent 工程 4 角色流水线落地加公式原生插入。
+两个月实习在工程能力、业务理解与方法论上显著成长。工程能力：C++/Java 混合栈开发，流处理加速 10+ 表达式提 PR 走通设计→实现→审计→修复全链路，Agent 工程 4 角色流水线落地加公式原生插入。
 
-业务理解：OmniStream 是面向 Flink 的 Native 化加速项目，解决 JVM 三瓶颈（GC/JIT/序列化），核心价值是零侵入接入不改 Flink 内核端到端提升流处理性能，适配金融风控、实时数仓等高吞吐低延迟场景。AgentOS 是九问平台上一体机办公 Agent，把大模型能力做成本地化可编辑交付的智能体，产物必须可编辑是中文办公刚需，WPS 兼容性催生公式原生插入核心难题。
+业务理解：流处理加速 是面向 Flink 的 Native 化加速项目，解决 JVM 三瓶颈（GC/JIT/序列化），核心价值是零侵入接入不改 Flink 内核端到端提升流处理性能，适配金融风控、实时数仓等高吞吐低延迟场景。AgentOS 是九问平台上一体机办公 Agent，把大模型能力做成本地化可编辑交付的智能体，产物必须可编辑是中文办公刚需，WPS 兼容性催生公式原生插入核心难题。
 
 方法论沉淀 15 条，核心几条：vanilla 对照组二分法做 bug 归因；只读旁路可观察性做 trace（落 workspace 不落 skill 目录）；纯净原则审计清单五类 16 项；声明式编排加动态生成代码；降级设计；允许 agent 犯错及时提示纠正。认知升级：工具是行为约束不只声明能力；隐式交互是脆弱的需显式强约束；思维链过长等于执行风险；看起来完整不等于真的能用；人工介入审计是质量闸门。
 
